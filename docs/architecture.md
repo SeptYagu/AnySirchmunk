@@ -1,0 +1,271 @@
+# AnySirchmunk 技术方案
+
+## 1. 方案结论
+
+AnyTXT 应作为 Sirchmunk 的一个可选检索后端接入，而不是位于 Sirchmunk 之外先搜索、再把结果手工交给另一个程序。
+
+Sirchmunk 的检索器已经向下游提供统一的事件结构。适配层只需让 AnyTXT 产生相同结构，现有的候选合并、证据读取、ReAct 循环、答案生成和知识保存便可以继续工作。这样可以把改动控制在检索边界，降低对知识库和用户界面的影响。
+
+## 2. 当前系统边界
+
+Sirchmunk 当前的关键调用关系为：
+
+```mermaid
+flowchart TD
+    S[AgenticSearch] --> G[GrepRetriever]
+    S --> T[KeywordSearchTool]
+    T --> G
+    G --> M[begin / match / end]
+    M --> C[候选合并与排序]
+    C --> F[FileReadTool / 文档提取]
+    F --> L[LLM 分析与答案]
+    L --> K[KnowledgeStorage]
+```
+
+检索器在以下位置被复用：
+
+- FAST 模式的逐关键词候选检索与正则回退。
+- DEEP 模式初始关键词探测。
+- DEEP ReAct 循环中的 `KeywordSearchTool`。
+- 独立的文件名搜索。
+
+知识持久化位于检索链下游，核心文件为：
+
+- `src/sirchmunk/schema/knowledge.py`
+- `src/sirchmunk/storage/knowledge_storage.py`
+
+因此第一阶段不需要改动知识 schema 或 Parquet 写入逻辑。
+
+## 3. 目标架构
+
+```mermaid
+flowchart TD
+    S[AgenticSearch] --> B{后端选择}
+    B -->|rga| G[GrepRetriever]
+    B -->|anytxt| H[FallbackRetriever]
+    H --> A[AnyTXTRetriever]
+    H -. 故障回退 .-> G
+    A --> RPC[AnyTXT JSON-RPC :9920]
+    A --> N[标准化检索事件]
+    G --> N
+    N --> T[KeywordSearchTool]
+    T --> F[文件读取与证据链]
+    F --> L[LLM 分析]
+    L --> K[KnowledgeStorage / Parquet]
+```
+
+建议以组合方式实现回退，而不是让 `AnyTXTRetriever` 继承 `GrepRetriever`。两者只是输出契约一致，底层能力和错误语义不同；组合可以避免意外继承替换、文件修改等与搜索无关的方法。
+
+## 4. 模块设计
+
+### 4.1 AnyTXT RPC 客户端
+
+建议新增：
+
+```text
+src/sirchmunk/retrieve/anytxt_retriever.py
+```
+
+内部职责分成两个类：
+
+```python
+class AnyTXTClient:
+    async def search(...): ...
+    async def get_fragment(...): ...
+
+class AnyTXTRetriever(BaseRetriever):
+    async def retrieve(...): ...
+    def merge_results(...): ...
+```
+
+`AnyTXTClient` 只负责 JSON-RPC、超时和响应校验。`AnyTXTRetriever` 负责 Sirchmunk 参数语义、路径过滤、去重和输出转换。
+
+可以使用 Python 标准库 HTTP 客户端并通过 `asyncio.to_thread` 包装，避免仅为本机 RPC 增加发布依赖；如果仓库已有稳定的异步 HTTP 依赖，也可以复用。最终实现前应以项目依赖和取消行为测试结果决定。
+
+### 4.2 RPC 调用
+
+已验证的搜索方法：
+
+```json
+{
+  "method": "ATRpcServer.Searcher.V1.GetResult",
+  "input": {
+    "pattern": "搜索词",
+    "filterDir": "D:\\OneDrive",
+    "filterExt": "",
+    "lastModifyBegin": 0,
+    "lastModifyEnd": 2147483647,
+    "limit": 300,
+    "offset": 0,
+    "order": 0
+  }
+}
+```
+
+响应会给出字段描述及文件记录，当前验证到的字段为 `fid`、`lastModify`、`size` 和 `file`。
+
+片段方法：
+
+```json
+{
+  "method": "ATRpcServer.Searcher.V1.GetFragment",
+  "input": {
+    "fid": "搜索结果中的文件标识",
+    "pattern": "搜索词"
+  }
+}
+```
+
+匹配文本从响应的 `output.text` 读取。
+
+RPC 地址、请求限制和超时都由配置提供。每个搜索根目录分别请求，结果再按规范化后的绝对路径去重。
+
+### 4.3 事件转换
+
+每个有效文件转换为一组事件：
+
+```json
+{
+  "type": "begin",
+  "data": {"path": {"text": "D:\\OneDrive\\paper.pdf"}},
+  "_search_backend": "anytxt"
+}
+```
+
+```json
+{
+  "type": "match",
+  "data": {
+    "path": {"text": "D:\\OneDrive\\paper.pdf"},
+    "lines": {"text": "AnyTXT 返回的命中片段"}
+  },
+  "score": 1.0,
+  "_search_backend": "anytxt"
+}
+```
+
+```json
+{
+  "type": "end",
+  "data": {"path": {"text": "D:\\OneDrive\\paper.pdf"}},
+  "_search_backend": "anytxt"
+}
+```
+
+AnyTXT 片段没有可靠行号时不伪造 `line_number`。Sirchmunk 对无行号的 PDF、DOCX 等格式本来就会使用片段模式，并在需要时调用文档提取器读取更多原文。
+
+### 4.4 参数映射
+
+| Sirchmunk 参数 | AnyTXT/适配层行为 |
+| --- | --- |
+| `terms` | 单词直接搜索；多个词按 `logic` 组合执行 |
+| `path` | 每个根目录映射到一次 `filterDir` 请求 |
+| `case_sensitive` | 若 AnyTXT 无等价开关，则搜索后在片段层校验 |
+| `literal` | AnyTXT 查询默认按普通检索词处理 |
+| `regex` | 只解析 Sirchmunk 自身生成的转义 OR 模式；其他正则回退到 `rga` |
+| `max_depth` | 对返回的绝对路径做相对层级过滤 |
+| `include` / `exclude` | 用 Windows 路径和文件名进行 glob 后过滤 |
+| `count_only` | 从去重后的命中记录生成计数结果 |
+| `timeout` | 作为 RPC 调用的上限 |
+
+AND 和 NOT 逻辑通过多次 AnyTXT 查询后按规范化文件路径做集合运算。无法无损表达的高级参数应显式标记为不支持并交给 `rga`，不能静默忽略。
+
+### 4.5 后端选择与回退
+
+`AgenticSearch.__init__` 根据配置构造统一的关键词检索器：
+
+```python
+backend = os.getenv("SIRCHMUNK_SEARCH_BACKEND", "rga")
+```
+
+- `rga`：创建现有 `GrepRetriever`。
+- `anytxt`：创建 `AnyTXTRetriever`，按配置决定故障时是否包装 `GrepRetriever` 回退。
+- `auto`：后续可增加健康检查后自动选择；第一阶段可以暂不暴露，避免模糊的运行行为。
+
+回退只针对后端故障、超时和不支持的查询能力。正常零结果应直接返回空结果，让 Sirchmunk 自己决定是否放宽关键词。
+
+检索器属性可以在过渡期继续使用现有名称，以减少主链路改动；更理想的后续重构是将类型从具体 `GrepRetriever` 改为一个明确的只读检索协议。
+
+### 4.6 文件名搜索
+
+当前 `retrieve_by_filename` 依赖 `rga --files` 枚举目录。第一阶段继续单独保留一个 `GrepRetriever` 用于 `FILENAME_ONLY` 和 FAST 的最终文件名回退。
+
+这意味着“内容检索使用 AnyTXT”与“文件名枚举使用 rga”可以同时存在。日志必须明确区分，避免用户误以为整次查询都经过 AnyTXT。
+
+### 4.7 知识存储
+
+AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后，仍由现有流程创建 `EvidenceUnit` 和 `KnowledgeCluster`，并通过 `KnowledgeStorage` 写入：
+
+```text
+{SIRCHMUNK_WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
+```
+
+不在 AnyTXT 索引中写入 Sirchmunk 的答案或知识簇，也不复制 AnyTXT 索引文件。这样可以保持职责清楚，并允许随时切回 `rga`。
+
+## 5. 预计改动范围
+
+在 Sirchmunk 上游代码中实施时，预计涉及：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/sirchmunk/retrieve/anytxt_retriever.py` | 新增 RPC 客户端、检索适配和结果转换 |
+| `src/sirchmunk/search.py` | 构造可配置内容检索器；保留文件名检索器 |
+| `src/sirchmunk/agentic/tools.py` | 将具体 `GrepRetriever` 类型提示放宽为检索协议；不改工具输出 |
+| `config/env.example` | 说明 AnyTXT 配置 |
+| `src/sirchmunk/cli/cli.py` | 让新初始化的 `.env` 包含非默认启用的配置说明 |
+| 测试目录 | 增加模拟 RPC 和搜索链集成测试 |
+
+不计划改动知识 schema、Parquet 文件结构、HTTP/MCP payload 或 Web 路由。
+
+## 6. 验证计划
+
+### 单元验证
+
+- 正常搜索响应转换为完整的事件组。
+- 多目录结果按绝对路径去重。
+- `include`、`exclude` 和 `max_depth` 正确过滤。
+- AND、OR、NOT 的文件集合结果正确。
+- 缺少字段、非法 JSON、超时和连接拒绝产生稳定错误。
+- 正常零结果不会触发故障回退。
+- 后端故障在启用配置时回退，并写入 `_fallback_reason`。
+
+### 集成验证
+
+- 使用本机 AnyTXT 搜索一组已知 PDF，核对文件路径和片段。
+- 运行 Sirchmunk FAST 查询，确认候选文件来自 AnyTXT，答案可引用原文件。
+- 运行一次受控的 DEEP 查询，确认初始探测和 ReAct 关键词工具都使用适配器。
+- 查询后检查知识簇已经写入并能再次读取。
+- 停止 AnyTXT 服务后验证 `rga` 回退。
+- 设置 `SIRCHMUNK_SEARCH_BACKEND=rga`，验证原行为未发生回归。
+
+### 工程检查
+
+- 对新增和修改的 Python 文件运行 `py_compile`。
+- 运行相关单元测试和现有最接近的检索测试。
+- 审查 Git diff，确保不包含 API key、用户文献内容或真实私人路径。
+
+## 7. 风险与处理
+
+| 风险 | 处理方式 |
+| --- | --- |
+| AnyTXT API 版本变化 | 集中封装 RPC；启动时进行轻量能力检查；保留 `rga` |
+| 片段没有行号 | 使用 Sirchmunk 现有无行号片段路径，并从原文件提取更多证据 |
+| AnyTXT 返回搜索范围外文件 | 以解析后的绝对路径进行强制根目录校验 |
+| 结果上限造成漏召回 | 分关键词、分目录请求；记录截断；允许配置上限 |
+| 正则语义不一致 | 只转换可识别模式，其余查询回退 `rga` |
+| 多设备同步冲突 | 第一阶段限定单写者；文档说明同步顺序 |
+| 上游 Sirchmunk 更新 | 适配器保持小接口；集成改动单独提交，便于重放和比较 |
+
+## 8. 回滚
+
+运行时回滚：
+
+```dotenv
+SIRCHMUNK_SEARCH_BACKEND=rga
+```
+
+代码回滚可以移除 AnyTXT 适配器和后端工厂改动。由于方案不改变知识 schema、API payload 或 AnyTXT 索引，回滚后已有知识数据仍可由原版 Sirchmunk 读取。
+
+## 9. 后续选择
+
+如果 Sirchmunk 上游结构变化过大或无法稳定注入检索器，第二方案是在 AnySirchmunk 中实现独立协调服务：它调用 AnyTXT 查找文件，读取证据并建立自己的知识存储。该方案需要重新实现知识聚类、合并、来源追踪和多轮复用，维护成本明显更高，因此只作为后备路线。

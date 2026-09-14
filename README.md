@@ -1,0 +1,78 @@
+# AnySirchmunk
+
+AnySirchmunk 计划把 [AnyTXT Searcher](https://anytxt.net/) 的本地全文索引接入 [Sirchmunk](https://github.com/modelscope/sirchmunk) 的检索链路。
+
+它保留两个软件各自擅长的部分：
+
+- AnyTXT 负责在已经建立索引的本地文献中快速查找文件和命中片段。
+- Sirchmunk 负责查询规划、证据读取、答案生成、知识聚类、历史知识复用和持久化。
+- 当 AnyTXT 不可用时，可以回退到 Sirchmunk 原有的 `rga` 检索器。
+
+项目目前处于方案设计阶段，尚未提供可运行版本。详细需求见 [docs/requirements.md](docs/requirements.md)，技术方案见 [docs/architecture.md](docs/architecture.md)。
+
+## 目标工作流
+
+```mermaid
+flowchart LR
+    Q[用户问题] --> P[Sirchmunk 查询规划]
+    P --> A[AnyTXT 本地索引检索]
+    A --> E[文件路径与命中片段]
+    E --> R[Sirchmunk 读取原始文件并分析]
+    R --> K[KnowledgeStorage]
+    R --> O[带来源的答案]
+    K --> P
+```
+
+## 第一阶段范围
+
+第一阶段会实现一个 AnyTXT 检索适配器，并尽量保持 Sirchmunk 的下游流程不变：
+
+1. 调用 AnyTXT 本机 JSON-RPC 服务搜索关键词。
+2. 将文件路径和命中片段转换为 Sirchmunk 当前检索器使用的数据结构。
+3. 让 Sirchmunk 的 FAST 和 DEEP 查询通过配置选择 AnyTXT。
+4. 继续使用 Sirchmunk 的原始文件读取、证据追踪和知识保存能力。
+5. AnyTXT 不可连接或请求失败时，记录原因并按配置回退到 `rga`。
+
+## 计划中的配置
+
+```dotenv
+SIRCHMUNK_SEARCH_BACKEND=anytxt
+ANYTXT_API_URL=http://127.0.0.1:9920
+ANYTXT_SEARCH_LIMIT=300
+ANYTXT_FALLBACK_TO_RGA=true
+```
+
+默认配置仍将保持 Sirchmunk 原有行为。只有显式选择 `anytxt` 后才使用 AnyTXT 索引。
+
+## 数据位置
+
+AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位于：
+
+```text
+{SIRCHMUNK_WORK_PATH}/.cache/knowledge/knowledge_clusters.parquet
+```
+
+例如把 `SIRCHMUNK_WORK_PATH` 设置为 `D:\OneDrive\SirchmunkData`，可以让知识文件进入 OneDrive。多个设备使用相同盘符和相同文献路径，有利于复用知识记录中的来源路径，但第一阶段不支持多台设备同时写同一份 Parquet 文件。使用前应等待 OneDrive 同步完成，并且同一时间只在一台设备运行写入任务。
+
+## 前置条件
+
+- Windows
+- AnyTXT Searcher 已安装、正在运行并完成文献索引
+- AnyTXT 本地 API 可通过 `127.0.0.1:9920` 访问
+- Sirchmunk 的 Python 环境可以正常运行
+- 已配置 Sirchmunk 使用的 LLM API
+
+## 当前状态
+
+- [x] 验证 AnyTXT 本地搜索接口可以返回文件路径
+- [x] 验证 AnyTXT 可以返回命中片段
+- [x] 梳理 Sirchmunk 检索结果与知识存储链路
+- [ ] 实现 AnyTXT JSON-RPC 客户端
+- [ ] 实现 Sirchmunk 检索器适配层
+- [ ] 接入 FAST 和 DEEP 检索
+- [ ] 增加自动回退和诊断日志
+- [ ] 完成本地集成测试
+
+## 上游项目
+
+AnySirchmunk 是一个独立集成项目。AnyTXT Searcher 和 Sirchmunk 的名称、代码及相关权利归各自所有者所有。后续实现会根据所采用的集成方式补充准确的许可证和分发说明。

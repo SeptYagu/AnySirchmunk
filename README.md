@@ -27,7 +27,7 @@ flowchart LR
 
 第一阶段会实现一个 AnyTXT 检索适配器，并尽量保持 Sirchmunk 的下游流程不变：
 
-1. 调用 AnyTXT 本机 JSON-RPC 服务搜索关键词。
+1. 调用 AnyTXT 本机 JSON-RPC 服务在全局索引中搜索关键词；用户明确限定范围时再过滤目录。
 2. 将文件路径和命中片段转换为 Sirchmunk 当前检索器使用的数据结构。
 3. 让 Sirchmunk 的 FAST 和 DEEP 查询通过配置选择 AnyTXT。
 4. 继续使用 Sirchmunk 的原始文件读取、证据追踪和知识保存能力。
@@ -66,12 +66,15 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 
 - [x] 验证 AnyTXT 本地搜索接口可以返回文件路径
 - [x] 验证 AnyTXT 可以返回命中片段
+- [x] 核对本机 1.3.2477 的索引格式、全局搜索和正则查询行为
 - [x] 梳理 Sirchmunk 检索结果与知识存储链路
 - [ ] 实现 AnyTXT JSON-RPC 客户端
 - [ ] 实现 Sirchmunk 检索器适配层
 - [ ] 接入 FAST 和 DEEP 检索
 - [ ] 增加自动回退和诊断日志
 - [ ] 完成本地集成测试
+
+本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。其中一个重要结论是：在已安装的 1.3.2477 中，全局 RPC 搜索需要使用空的 `filterDir`；论坛示例中的 `"*"` 在本机返回零结果。实现会进行能力探测，避免依赖单一版本的未文档化行为。
 
 ## 上游项目
 

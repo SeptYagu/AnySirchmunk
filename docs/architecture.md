@@ -45,7 +45,7 @@ flowchart TD
     B -->|anytxt| H[FallbackRetriever]
     H --> A[AnyTXTRetriever]
     H -. 故障回退 .-> G
-    A --> RPC[AnyTXT JSON-RPC :9920]
+    A --> RPC[AnyTXT 全局索引 JSON-RPC :9920]
     A --> N[标准化检索事件]
     G --> N
     N --> T[KeywordSearchTool]
@@ -91,7 +91,7 @@ class AnyTXTRetriever(BaseRetriever):
   "method": "ATRpcServer.Searcher.V1.GetResult",
   "input": {
     "pattern": "搜索词",
-    "filterDir": "D:\\OneDrive",
+    "filterDir": "",
     "filterExt": "",
     "lastModifyBegin": 0,
     "lastModifyEnd": 2147483647,
@@ -118,7 +118,9 @@ class AnyTXTRetriever(BaseRetriever):
 
 匹配文本从响应的 `output.text` 读取。
 
-RPC 地址、请求限制和超时都由配置提供。每个搜索根目录分别请求，结果再按规范化后的绝对路径去重。
+RPC 地址、请求限制和超时都由配置提供。未显式指定搜索范围时，使用空 `filterDir` 查询 AnyTXT 全局索引。用户明确指定一个或多个根目录时，每个根目录分别请求，结果再按规范化后的绝对路径去重。
+
+本机 1.3.2477 实测中，空字符串可以全局搜索，`"*"` 返回零结果；官方论坛示例则使用 `"*"`。这属于 Beta API 的版本或环境差异，不能把论坛示例直接硬编码。详细记录见 [anytxt-capabilities.md](anytxt-capabilities.md)。
 
 ### 4.3 事件转换
 
@@ -159,10 +161,10 @@ AnyTXT 片段没有可靠行号时不伪造 `line_number`。Sirchmunk 对无行�
 | Sirchmunk 参数 | AnyTXT/适配层行为 |
 | --- | --- |
 | `terms` | 单词直接搜索；多个词按 `logic` 组合执行 |
-| `path` | 每个根目录映射到一次 `filterDir` 请求 |
+| `path` | 未明确限定时使用空 `filterDir` 全局搜索；明确限定时每个根目录对应一次请求 |
 | `case_sensitive` | 若 AnyTXT 无等价开关，则搜索后在片段层校验 |
 | `literal` | AnyTXT 查询默认按普通检索词处理 |
-| `regex` | 只解析 Sirchmunk 自身生成的转义 OR 模式；其他正则回退到 `rga` |
+| `regex` | 能力探测通过时交给 AnyTXT；语法不兼容或模式不可控时回退到 `rga` |
 | `max_depth` | 对返回的绝对路径做相对层级过滤 |
 | `include` / `exclude` | 用 Windows 路径和文件名进行 glob 后过滤 |
 | `count_only` | 从去重后的命中记录生成计数结果 |
@@ -170,7 +172,21 @@ AnyTXT 片段没有可靠行号时不伪造 `line_number`。Sirchmunk 对无行�
 
 AND 和 NOT 逻辑通过多次 AnyTXT 查询后按规范化文件路径做集合运算。无法无损表达的高级参数应显式标记为不支持并交给 `rga`，不能静默忽略。
 
-### 4.5 后端选择与回退
+AnyTXT 1.3.2477 的图形界面和本地资源明确提供正则搜索，本机 RPC 对若干正则形式也能返回结果，但公开的 `GetResult` 输入没有独立 `searchType` 字段。适配器需要以受控查询验证当前 RPC 状态，不能假定 GUI 选项与 RPC 始终同步。
+
+### 4.5 能力探测
+
+适配器为每个 AnyTXT 运行实例维护一份短期能力记录：
+
+1. 验证端口和 JSON-RPC 基本响应结构。
+2. 使用不会暴露文档内容的受控查询确认全局目录参数。
+3. 确认 `GetResult` 和 `GetFragment` 的字段结构。
+4. 在需要正则时执行轻量探测，确认当前模式能够解释正则。
+5. 记录失败类别，决定继续使用 AnyTXT、降级普通查询或回退 `rga`。
+
+能力探测不能依赖某个词在用户语料中必然存在。实现测试使用模拟 RPC；真实环境可以利用接口错误和响应结构检测，并把不确定能力标为未知，在首次实际查询时验证。
+
+### 4.6 后端选择与回退
 
 `AgenticSearch.__init__` 根据配置构造统一的关键词检索器：
 
@@ -186,13 +202,13 @@ backend = os.getenv("SIRCHMUNK_SEARCH_BACKEND", "rga")
 
 检索器属性可以在过渡期继续使用现有名称，以减少主链路改动；更理想的后续重构是将类型从具体 `GrepRetriever` 改为一个明确的只读检索协议。
 
-### 4.6 文件名搜索
+### 4.7 文件名搜索
 
 当前 `retrieve_by_filename` 依赖 `rga --files` 枚举目录。第一阶段继续单独保留一个 `GrepRetriever` 用于 `FILENAME_ONLY` 和 FAST 的最终文件名回退。
 
 这意味着“内容检索使用 AnyTXT”与“文件名枚举使用 rga”可以同时存在。日志必须明确区分，避免用户误以为整次查询都经过 AnyTXT。
 
-### 4.7 知识存储
+### 4.8 知识存储
 
 AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后，仍由现有流程创建 `EvidenceUnit` 和 `KnowledgeCluster`，并通过 `KnowledgeStorage` 写入：
 
@@ -222,6 +238,8 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 ### 单元验证
 
 - 正常搜索响应转换为完整的事件组。
+- 空 `filterDir` 的全局搜索和显式目录搜索分别按预期工作。
+- 模拟不同版本对空字符串和 `"*"` 的处理，验证兼容选择不会污染实际搜索结果。
 - 多目录结果按绝对路径去重。
 - `include`、`exclude` 和 `max_depth` 正确过滤。
 - AND、OR、NOT 的文件集合结果正确。
@@ -251,8 +269,9 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 | AnyTXT API 版本变化 | 集中封装 RPC；启动时进行轻量能力检查；保留 `rga` |
 | 片段没有行号 | 使用 Sirchmunk 现有无行号片段路径，并从原文件提取更多证据 |
 | AnyTXT 返回搜索范围外文件 | 以解析后的绝对路径进行强制根目录校验 |
-| 结果上限造成漏召回 | 分关键词、分目录请求；记录截断；允许配置上限 |
-| 正则语义不一致 | 只转换可识别模式，其余查询回退 `rga` |
+| 结果上限造成漏召回 | 分关键词请求；显式限定路径时可分目录请求；记录截断；允许配置上限 |
+| 全局目录参数语义变化 | 优先使用当前版本验证值；能力探测其他兼容形式；记录所选策略 |
+| 正则语义或模式状态不一致 | 运行时探测；不支持时降级普通查询或回退 `rga` |
 | 多设备同步冲突 | 第一阶段限定单写者；文档说明同步顺序 |
 | 上游 Sirchmunk 更新 | 适配器保持小接口；集成改动单独提交，便于重放和比较 |
 

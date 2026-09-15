@@ -243,7 +243,12 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 
 ### 5.1 上游基线与交付方式
 
-第一阶段采用针对固定 Sirchmunk commit 的补丁集，由 AnySirchmunk 管理补丁、安装说明和测试；不要求用户直接跟随上游 main。当前尚未选定和验证该 commit，因此下表是预计改动，不是已确认的完整清单。进入代码实现前，必须记录完整 SHA、Python/依赖版本、许可证，以及从干净 checkout 应用补丁和回滚的命令。
+第一阶段采用针对固定 Sirchmunk commit 的补丁集，由 AnySirchmunk 管理补丁、安装说明和测试；不要求用户直接跟随上游 main。当前锁定 commit 为
+`3c7ee54f93fa198db2020a3ab850356f2dacff72`（Apache-2.0，Python >=3.10）。
+验证环境为 Python 3.14.3；上游 `requirements/core.txt` 与
+`requirements/tests.txt` 的 SHA-256 记录在 `baseline.json`。安装、验证和反向应用
+补丁的命令由 `scripts/apply.ps1`、`scripts/verify.ps1` 和
+`scripts/rollback.ps1` 提供。
 
 2026-09-14 方案审查参考的[上游 search.py](https://github.com/modelscope/sirchmunk/blob/main/src/sirchmunk/search.py)中，DEEP 的 `_react_explore_files` 存在空路径直接返回分支。这说明不能仅替换构造函数便宣称全局搜索已接通；该链接为可变参考，不构成锁定基线。
 

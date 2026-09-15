@@ -8,7 +8,9 @@ AnySirchmunk 计划把 [AnyTXT Searcher](https://anytxt.net/) 的本地全文索
 - Sirchmunk 负责查询规划、证据读取、答案生成、知识聚类、历史知识复用和持久化。
 - 当 AnyTXT 不可用且有明确搜索目录时，可以按配置回退到 Sirchmunk 原有的 `rga` 检索器。
 
-项目目前处于方案设计阶段，尚未提供可运行版本。详细需求见 [docs/requirements.md](docs/requirements.md)，技术方案见 [docs/architecture.md](docs/architecture.md)。
+项目已提供面向固定 Sirchmunk 基线的第一版补丁。详细需求见
+[docs/requirements.md](docs/requirements.md)，技术方案见
+[docs/architecture.md](docs/architecture.md)，锁定信息见 [baseline.json](baseline.json)。
 
 ## 目标工作流
 
@@ -69,20 +71,57 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 - Sirchmunk 的 Python 环境可以正常运行
 - 已配置 Sirchmunk 使用的 LLM API
 
-## 当前状态
+## 安装
+
+补丁只适用于 Sirchmunk commit
+`3c7ee54f93fa198db2020a3ab850356f2dacff72`。先准备一个干净 checkout：
+
+```powershell
+git clone https://github.com/modelscope/sirchmunk.git
+git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
+.\scripts\apply.ps1 -SirchmunkPath .\sirchmunk
+.\scripts\verify.ps1 -SirchmunkPath .\sirchmunk
+```
+
+随后按 Sirchmunk 自身说明安装依赖，在其 `.env` 中显式启用：
+
+```dotenv
+SIRCHMUNK_SEARCH_BACKEND=anytxt
+ANYTXT_API_URL=http://127.0.0.1:9920
+```
+
+不设置 `SIRCHMUNK_SEARCH_BACKEND` 时仍使用上游 `rga`。全局搜索发生故障时，
+只有配置了真实存在的绝对目录数组才允许缩小范围回退：
+
+```dotenv
+ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
+```
+
+回滚补丁：
+
+```powershell
+.\scripts\rollback.ps1 -SirchmunkPath .\sirchmunk
+```
+
+## 已实现范围
 
 - [x] 验证 AnyTXT 本地搜索接口可以返回文件路径
 - [x] 验证 AnyTXT 可以返回命中片段
 - [x] 核对本机 1.3.2477 的索引格式、全局搜索和正则查询行为
 - [x] 梳理 Sirchmunk 检索结果与知识存储链路
-- [ ] 锁定 Sirchmunk commit、依赖与补丁交付步骤
-- [ ] 验证字面量、分页和全局/显式范围调用契约
-- [ ] 实现 AnyTXT JSON-RPC 客户端
-- [ ] 实现 Sirchmunk 检索器适配层
-- [ ] 接入 FAST 和 DEEP 检索
-- [ ] 增加自动回退和诊断日志
-- [ ] 完成本地集成测试
+- [x] 锁定 Sirchmunk commit、依赖清单校验值与补丁交付步骤
+- [x] 验证本机分页 offset、当前页 count 和全局/显式范围调用契约
+- [x] 实现 AnyTXT JSON-RPC 客户端
+- [x] 实现 Sirchmunk 检索器适配层
+- [x] 接入 FAST、DEEP 初始关键词检索和 ReAct 关键词工具
+- [x] 增加有界回退、完整性 metadata 和诊断日志
+- [x] 完成模拟 RPC 契约测试、真实 RPC smoke test 及补丁应用/回滚验证
+- [ ] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
 - [ ] 完成固定语料上的召回与性能基准
+
+当前对正则、大小写敏感、whole-word、精确 count，以及包含正则元字符的
+literal 查询保持保守策略：显式范围内按配置回退到 `rga`；全局且没有
+`ANYTXT_FALLBACK_ROOTS` 时明确报不支持，不静默改变语义。
 
 本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。在已安装的 1.3.2477 中，全局 RPC 搜索使用空 `filterDir`；论坛示例中的 `"*"` 在本机返回零结果。第一版采用此兼容配置；未知版本或语义需已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。
 

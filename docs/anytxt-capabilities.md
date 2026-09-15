@@ -135,6 +135,12 @@ ATRpcServer.Searcher.V1.GetFragment
 
 崩溃会终止整个 RPC 服务：进程消失、9920 不再监听、日志中没有任何错误记录，此后每个请求都返回 `WinError 10061 连接被拒`，整轮检索全部失败。因此适配器默认 `ANYTXT_MAX_CONCURRENCY=2`；调高会让一次查询在服务崩溃后彻底失败，不属于已验证配置。
 
+降低并发与片段请求量能显著延长稳定运行时间：`ANYTXT_MAX_CONCURRENCY=1` 加
+`ANYTXT_MAX_FRAGMENT_REQUESTS=20` 时，一次 7.5 分钟的 DEEP 查询（6 轮 ReAct、数百个请求）
+只遇到一次短暂不可用；配合进程级自动重启（崩溃即拉起 ATGUI.exe）即可跑完长查询。
+DEEP 一类长查询建议显式使用这组低负载配置，并给 `ATGUI.exe` 配置自动重启。
+崩溃窗口内的检索会以 WARNING 明确记录，不会静默降级成零结果。
+
 ## 5. 全局搜索参数差异
 
 在本机 1.3.2477 中，对同一个已知可命中的查询进行只读对照：

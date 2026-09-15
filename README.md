@@ -121,8 +121,22 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 - [x] 接入 FAST、DEEP 初始关键词检索和 ReAct 关键词工具
 - [x] 增加有界回退、完整性 metadata 和诊断日志
 - [x] 完成模拟 RPC 契约测试、真实 RPC smoke test 及补丁应用/回滚验证
-- [ ] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
+- [x] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
 - [ ] 完成固定语料上的召回与性能基准
+
+2026-09-15 在本机完整环境（Sirchmunk `3c7ee54` + AnyTXT 1.3.2477 + `D:\OneDrive\SirchmunkData`）
+完成了端到端验收：FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`
+（`search_backend=anytxt`，事件带 `_search_backend=anytxt`）；无显式范围时按
+`ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，实测命中覆盖 C/D/E 三个卷；查询后的知识簇写入
+`.cache/knowledge/knowledge_clusters.parquet`，并能在下一次查询中复用。
+
+DEEP 这类长查询建议使用低负载配置，并让 AnyTXT 进程带自动重启兜底——本机 1.3.2477 的
+Beta RPC 服务在高负载下会段错误退出（实测见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.4 节）：
+
+```dotenv
+ANYTXT_MAX_CONCURRENCY=1
+ANYTXT_MAX_FRAGMENT_REQUESTS=20
+```
 
 当前对正则、大小写敏感、whole-word、精确 count，以及包含正则元字符的
 literal 查询保持保守策略：显式范围内按配置回退到 `rga`；全局且没有

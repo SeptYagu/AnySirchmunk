@@ -5,12 +5,15 @@ Replays the request mix the adapter produces (candidate search + fragment
 lookup) against a running AnyTXT Searcher and reports where, if anywhere, the
 service stops answering.  It exists because the AnyTXT Beta RPC service was
 observed to die under sustained load, and we need a reproducible way to compare
-builds, endpoints and settings.
+builds and settings.
 
-Two endpoints are supported, because AnyTXT ships both:
+Only the documented v1 interface is probed:
 
-  legacy  http://127.0.0.1:9920/     ATRpcServer.Searcher.V1.*   params.input
-  v1      http://127.0.0.1:9924/rpc  anytxt.v1.*                 params
+  v1  http://127.0.0.1:9924/rpc  anytxt.v1.*
+
+The legacy ``ATRpcServer.Searcher.V1.*`` service on port 9920 is no longer
+supported by this project; the measurements taken against it on 1.3.2477 and
+1.3.3541 are kept in docs/anytxt-capabilities.md as history.
 
 Standard library only.  On Windows it also samples the ATGUI.exe working set so
 a memory leak shows up as a trend rather than a surprise.
@@ -35,30 +38,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
-ENDPOINTS: Dict[str, Dict[str, Any]] = {
-    "legacy": {
-        "port": 9920,
-        "path": "/",
-        "search": "ATRpcServer.Searcher.V1.GetResult",
-        "fragment": "ATRpcServer.Searcher.V1.GetFragment",
-        "nested": True,
-    },
-    "v1": {
-        "port": 9924,
-        "path": "/rpc",
-        "search": "anytxt.v1.getResult",
-        "fragment": "anytxt.v1.getFragment",
-        "nested": False,
-    },
+ENDPOINT: Dict[str, Any] = {
+    "port": 9924,
+    "path": "/rpc",
+    "search": "anytxt.v1.getResult",
+    "fragment": "anytxt.v1.getFragment",
 }
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--api", choices=tuple(ENDPOINTS), default="v1",
-                        help="legacy endpoint on 9920, or the anytxt.v1 endpoint on 9924/rpc")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=None, help="defaults to the endpoint's port")
+    parser.add_argument("--port", type=int, default=None, help="defaults to the v1 endpoint's port (9924)")
     parser.add_argument("--patterns", default="partimento,counterpoint,历史起源",
                         help="comma separated search patterns; non-ASCII ones exercise the known crash trigger")
     parser.add_argument("--drives", default="C:\\,D:\\",
@@ -121,24 +112,35 @@ def call(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
 
 def search_payload(spec: Dict[str, Any], pattern: str, drive: str, limit: int,
                    offset: int = 0) -> Dict[str, Any]:
+    # Mirrors the adapter's request shape (v1 parameters go directly in params,
+    # page order 3 = path ascending, no upper modification-time bound).
     params = {"pattern": pattern, "filterDir": drive, "filterExt": "",
-              "lastModifyBegin": 0, "lastModifyEnd": 2147483647,
-              "limit": limit, "offset": offset, "order": 0}
-    return {"jsonrpc": "2.0", "id": 1, "method": spec["search"],
-            "params": {"input": params} if spec["nested"] else params}
+              "lastModifyBegin": 0, "lastModifyEnd": 0,
+              "limit": limit, "offset": offset, "order": 3}
+    return {"jsonrpc": "2.0", "id": 1, "method": spec["search"], "params": params}
 
 
 def fragment_payload(spec: Dict[str, Any], fid: Any, pattern: str) -> Dict[str, Any]:
     params = {"fid": fid, "pattern": pattern}
-    return {"jsonrpc": "2.0", "id": 1, "method": spec["fragment"],
-            "params": {"input": params} if spec["nested"] else params}
+    return {"jsonrpc": "2.0", "id": 1, "method": spec["fragment"], "params": params}
 
 
 def collect_fids(url: str, spec: Dict[str, Any], pattern: str, drive: str,
                  limit: int, timeout: float) -> List[str]:
     try:
         response = call(url, search_payload(spec, pattern, drive, limit), timeout)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        # Never fail silently: an empty pool used to mean "no candidates", which
+        # is indistinguishable from "the request itself was broken".
+        print(f"candidate discovery for {pattern!r} in {drive!r} failed: {type(exc).__name__}: {exc}")
+        return []
+    error = response.get("error")
+    if error:
+        print(f"candidate discovery for {pattern!r} in {drive!r} was rejected: {error}")
+        return []
+    errno = (response.get("result") or {}).get("errno")
+    if errno:
+        print(f"candidate discovery for {pattern!r} in {drive!r} answered errno {errno}")
         return []
     output = response.get("result", {}).get("data", {}).get("output", {}) or {}
     fields = output.get("field") or []
@@ -153,21 +155,21 @@ def collect_fids(url: str, spec: Dict[str, Any], pattern: str, drive: str,
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    spec = ENDPOINTS[args.api]
+    spec = ENDPOINT
     port = args.port or spec["port"]
     url = f"http://{args.host}:{port}{spec['path']}"
     patterns = [p.strip() for p in args.patterns.split(",") if p.strip()]
     drives = [d.strip() for d in args.drives.split(",") if d.strip()]
 
     if not service_alive(args.host, port):
-        print(f"service is not listening on {args.host}:{port} ({args.api})")
+        print(f"service is not listening on {args.host}:{port} (AnyTXT v1 API, 1.3.3541+)")
         return 2
 
     fid_pool: List[Tuple[str, str]] = []
     for index, pattern in enumerate(patterns):
         fids = collect_fids(url, spec, pattern, drives[index % len(drives)], args.limit, args.timeout)
         fid_pool.extend((fid, pattern) for fid in fids)
-    print(f"endpoint: {args.api} -> {url}")
+    print(f"endpoint: {url}")
     print(f"fid pool: {len(fid_pool)} entries from {len(patterns)} patterns")
     if not fid_pool:
         print("no candidates returned; cannot probe fragment lookups")
@@ -229,7 +231,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 break
 
     alive_after = service_alive(args.host, port)
-    print(f"\nsummary: endpoint={args.api} ok={ok} fail={failed} alive_after={alive_after} "
+    print(f"\nsummary: endpoint={url} ok={ok} fail={failed} alive_after={alive_after} "
           f"elapsed={time.monotonic() - started:.1f}s")
     if first_failure_at is not None:
         print(f"first failure at request #{first_failure_at}")

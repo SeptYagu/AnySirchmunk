@@ -1,19 +1,21 @@
 diff --git a/config/env.example b/config/env.example
-index c2c3ae0..b905a21 100644
+index c2c3ae0..e284a94 100644
 --- a/config/env.example
 +++ b/config/env.example
-@@ -82,6 +82,24 @@ GREP_RGA_BACKOFF_SECONDS=60.0
+@@ -82,6 +82,26 @@ GREP_RGA_BACKOFF_SECONDS=60.0
  # Fall back to native rg when rga is unavailable or times out
  GREP_FALLBACK_TO_RG=true
  
 +# Content search backend. The upstream-compatible default remains rga.
 +SIRCHMUNK_SEARCH_BACKEND=rga
-+ANYTXT_API_MODE=v1
++# AnyTXT 1.3.3541+ local v1 API; the older legacy interface is not supported.
 +ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 +ANYTXT_SEARCH_LIMIT=300
 +ANYTXT_REQUEST_TIMEOUT=15
 +ANYTXT_TOTAL_TIMEOUT=30
 +ANYTXT_MAX_CONCURRENCY=2
++ANYTXT_PAGE_ORDER=3
++ANYTXT_EXACT_COUNT=true
 +ANYTXT_MAX_REQUESTS=100
 +ANYTXT_MAX_CANDIDATES=3000
 +ANYTXT_MAX_FRAGMENT_CHARS=100000
@@ -81,22 +83,24 @@ index 8a6f48b..aba547a 100644
          }
  
 diff --git a/src/sirchmunk/cli/cli.py b/src/sirchmunk/cli/cli.py
-index ba407ed..63ed3f7 100644
+index ba407ed..9d5fe6d 100644
 --- a/src/sirchmunk/cli/cli.py
 +++ b/src/sirchmunk/cli/cli.py
-@@ -196,6 +196,23 @@ GREP_RGA_BACKOFF_SECONDS=60.0
+@@ -196,6 +196,25 @@ GREP_RGA_BACKOFF_SECONDS=60.0
  # Fall back to native rg when rga is unavailable or times out
  GREP_FALLBACK_TO_RG=true
  
 +# ===== Optional AnyTXT content search backend =====
 +# Keep rga for the default upstream behaviour; set to anytxt to opt in.
 +SIRCHMUNK_SEARCH_BACKEND=rga
-+ANYTXT_API_MODE=v1
++# AnyTXT 1.3.3541+ local v1 API; the older legacy interface is not supported.
 +ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 +ANYTXT_SEARCH_LIMIT=300
 +ANYTXT_REQUEST_TIMEOUT=15
 +ANYTXT_TOTAL_TIMEOUT=30
 +ANYTXT_MAX_CONCURRENCY=2
++ANYTXT_PAGE_ORDER=3
++ANYTXT_EXACT_COUNT=true
 +ANYTXT_MAX_REQUESTS=100
 +ANYTXT_MAX_CANDIDATES=3000
 +ANYTXT_MAX_FRAGMENT_CHARS=100000
@@ -110,15 +114,22 @@ index ba407ed..63ed3f7 100644
  SIRCHMUNK_ENABLE_CLUSTER_REUSE=true
 diff --git a/src/sirchmunk/retrieve/anytxt_retriever.py b/src/sirchmunk/retrieve/anytxt_retriever.py
 new file mode 100644
-index 0000000..d0fee6c
+index 0000000..bbe3eaf
 --- /dev/null
 +++ b/src/sirchmunk/retrieve/anytxt_retriever.py
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,1117 @@
 +"""AnyTXT Searcher JSON-RPC adapter for Sirchmunk.
 +
 +This module intentionally uses only the Python standard library.  AnyTXT is a
 +candidate/fragment service; Sirchmunk remains responsible for reading source
 +files and building evidence.
++
++Only the documented AnyTXT **v1** API (``anytxt.v1.*`` on
++``http://127.0.0.1:9924/rpc``, AnyTXT 1.3.3541 or newer) is supported.  The
++legacy ``ATRpcServer.Searcher.V1.*`` service on port 9920 is not: it cannot
++serve a full DEEP query (it exits mid-run under that load) and it uses a
++different parameter envelope, so supporting both only widened the failure
++surface.
 +"""
 +
 +from __future__ import annotations
@@ -155,29 +166,36 @@ index 0000000..d0fee6c
 +#: HTTP 400 with an empty body, so they are part of the compatibility contract.
 +RPC_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 +
-+#: AnyTXT exposes two RPC surfaces from the same process.  ``v1`` is the
-+#: documented endpoint and stayed healthy through the load that killed the
-+#: legacy one, so it is the default; ``legacy`` remains for older builds that do
-+#: not ship the v1 endpoint.
-+API_MODES: Dict[str, Dict[str, Any]] = {
-+    "v1": {
-+        "default_url": "http://127.0.0.1:9924/rpc",
-+        "search": "anytxt.v1.getResult",
-+        "fragment": "anytxt.v1.getFragment",
-+        "nested": False,
-+    },
-+    "legacy": {
-+        "default_url": "http://127.0.0.1:9920",
-+        "search": "ATRpcServer.Searcher.V1.GetResult",
-+        "fragment": "ATRpcServer.Searcher.V1.GetFragment",
-+        "nested": True,
-+    },
-+}
++#: The documented AnyTXT v1 surface.  API versions are carried by the JSON-RPC
++#: method name, so the URL itself has no version segment.
++DEFAULT_API_URL = "http://127.0.0.1:9924/rpc"
++SEARCH_METHOD = "anytxt.v1.getResult"
++COUNT_METHOD = "anytxt.v1.search"
++FRAGMENT_METHOD = "anytxt.v1.getFragment"
++STATUS_METHOD = "anytxt.v1.status"
++
++#: ``result.errno`` is AnyTXT's business status and is *not* a transport
++#: failure.  Measured on 1.3.3541: ``filterDir`` pointing at an unindexed
++#: volume and an unresolvable ``fid`` both answer ``errno = 1`` with an empty
++#: payload, while malformed requests use the JSON-RPC ``error`` member
++#: (``-32602``).  Ignoring ``errno`` makes an unsearchable scope look exactly
++#: like a scope with no matches.
++ERRNO_OK = 0
++
++#: AnyTXT's fragment text wraps every hit in these markers.  They are a GUI
++#: artefact; the evidence handed to Sirchmunk must be the document text.
++HIGHLIGHT_OPEN = "*<<*"
++HIGHLIGHT_CLOSE = "*>>*"
++
++#: v1 rejects ``limit`` outside this range with ``-32602``.
++PAGE_SIZE_MIN = 1
++PAGE_SIZE_MAX = 300
 +
 +#: ``filterDir=""`` is *not* a global search.  AnyTXT resolves the empty value to
 +#: its own current directory (observed: ``C:``) and returns that drive only.
 +SERVER_DEFAULT_SCOPE = "anytxt_server_default"
 +UNVERIFIED_GLOBAL_REASON = "unverified_global_scope"
++ENGINE_NOT_READY_REASON = "engine_not_ready"
 +
 +
 +class AnyTXTError(RuntimeError):
@@ -190,6 +208,16 @@ index 0000000..d0fee6c
 +
 +class AnyTXTRequestTimeout(AnyTXTBackendError):
 +    """The local service did not answer before the per-request timeout."""
++
++
++class AnyTXTProtocolError(AnyTXTBackendError):
++    """The service rejected the request at the JSON-RPC layer.
++
++    Codes worth naming (AnyTXT v1 reference): ``-32601`` method not found,
++    ``-32602`` missing or invalid parameter.  Both mean the adapter asked for
++    something this build cannot do, so they must not be reported as a generic
++    transport failure.
++    """
 +
 +
 +class AnyTXTUnsupportedQuery(AnyTXTError):
@@ -222,9 +250,8 @@ index 0000000..d0fee6c
 +
 +@dataclass(frozen=True)
 +class AnyTXTConfig:
-+    #: ``v1`` (documented endpoint, default) or ``legacy`` (builds without it).
-+    api_mode: str = "v1"
-+    api_url: str = API_MODES["v1"]["default_url"]
++    #: Loopback URL of the AnyTXT v1 JSON-RPC service.
++    api_url: str = DEFAULT_API_URL
 +    page_size: int = 300
 +    request_timeout: float = 15.0
 +    total_timeout: float = 30.0
@@ -232,7 +259,12 @@ index 0000000..d0fee6c
 +    #: several requests overlap with non-ASCII patterns, which kills the whole
 +    #: service for the rest of the run.  Concurrency 2 passed 90 consecutive
 +    #: requests including CJK patterns; higher values stay unverified.
++    #: 1.3.3541 survived 600 mixed requests at this value.
 +    max_concurrency: int = 2
++    #: Deterministic page ordering.  AnyTXT's default order (0) is not
++    #: guaranteed stable across pages, which is what makes a long enumeration
++    #: risk skipping or repeating a file.  3 = path ascending.
++    page_order: int = 3
 +    max_requests: int = 100
 +    max_candidates: int = 3000
 +    max_fragment_chars: int = 100000
@@ -245,6 +277,10 @@ index 0000000..d0fee6c
 +    #: unverified server default directory is used and the result is reported as
 +    #: incomplete instead of pretending to be a global index search.
 +    global_roots: tuple[str, ...] = ()
++    #: Ask ``anytxt.v1.search`` for the exact total before paging.  One extra
++    #: request per term and scope turns "did we see every match" from a
++    #: heuristic into an answer.
++    exact_count: bool = True
 +
 +    @classmethod
 +    def from_env(cls) -> "AnyTXTConfig":
@@ -275,23 +311,38 @@ index 0000000..d0fee6c
 +            roots.append(root)
 +        global_roots = _env_roots("ANYTXT_GLOBAL_ROOTS", os.getenv("ANYTXT_GLOBAL_ROOTS", "[]"))
 +
-+        api_mode = os.getenv("ANYTXT_API_MODE", cls.api_mode).strip().lower()
-+        if api_mode not in API_MODES:
-+            raise ValueError("ANYTXT_API_MODE must be 'v1' or 'legacy'")
-+        api_url = os.getenv("ANYTXT_API_URL", API_MODES[api_mode]["default_url"])
++        # The legacy mode was removed together with its endpoint.  Failing loudly
++        # beats silently answering through a different API than the one the
++        # operator configured.
++        api_mode = os.getenv("ANYTXT_API_MODE", "v1").strip().lower()
++        if api_mode != "v1":
++            raise ValueError(
++                "ANYTXT_API_MODE=%r is no longer supported: AnySirchmunk now requires the AnyTXT "
++                "1.3.3541+ v1 API (anytxt.v1.* on http://127.0.0.1:9924/rpc)" % api_mode
++            )
++        api_url = os.getenv("ANYTXT_API_URL", cls.api_url)
 +        parsed = urlparse(api_url)
 +        if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
 +            raise ValueError("ANYTXT_API_URL must be an HTTP loopback URL")
++        page_size = positive("ANYTXT_SEARCH_LIMIT", "300", int)
++        if not PAGE_SIZE_MIN <= page_size <= PAGE_SIZE_MAX:
++            raise ValueError(
++                f"ANYTXT_SEARCH_LIMIT must be between {PAGE_SIZE_MIN} and {PAGE_SIZE_MAX}; "
++                "AnyTXT v1 rejects any other limit with -32602"
++            )
 +        fallback = os.getenv("ANYTXT_FALLBACK_TO_RGA", "true").strip().lower()
 +        if fallback not in {"true", "false", "1", "0", "yes", "no"}:
 +            raise ValueError("ANYTXT_FALLBACK_TO_RGA must be a boolean")
++        exact = os.getenv("ANYTXT_EXACT_COUNT", "true").strip().lower()
++        if exact not in {"true", "false", "1", "0", "yes", "no"}:
++            raise ValueError("ANYTXT_EXACT_COUNT must be a boolean")
 +        return cls(
-+            api_mode=api_mode,
 +            api_url=api_url,
-+            page_size=positive("ANYTXT_SEARCH_LIMIT", "300", int),
++            page_size=page_size,
 +            request_timeout=positive("ANYTXT_REQUEST_TIMEOUT", "15", float),
 +            total_timeout=positive("ANYTXT_TOTAL_TIMEOUT", "30", float),
 +            max_concurrency=positive("ANYTXT_MAX_CONCURRENCY", "2", int),
++            page_order=positive("ANYTXT_PAGE_ORDER", "3", int),
 +            max_requests=positive("ANYTXT_MAX_REQUESTS", "100", int),
 +            max_candidates=positive("ANYTXT_MAX_CANDIDATES", "3000", int),
 +            max_fragment_chars=positive("ANYTXT_MAX_FRAGMENT_CHARS", "100000", int),
@@ -299,13 +350,34 @@ index 0000000..d0fee6c
 +            fallback_to_rga=fallback in {"true", "1", "yes"},
 +            fallback_roots=tuple(roots),
 +            global_roots=tuple(global_roots),
++            exact_count=exact in {"true", "1", "yes"},
 +        )
 +
 +
 +@dataclass(frozen=True)
 +class SearchPage:
++    """One page of matching file metadata.
++
++    ``count`` is the number of rows in *this* page: ``getResult`` does not
++    report a total.  Use :class:`SearchTotal` for that.
++    """
++
 +    files: tuple[Dict[str, Any], ...]
 +    count: Optional[int]
++    errno: int = ERRNO_OK
++
++
++@dataclass(frozen=True)
++class SearchTotal:
++    """Answer of ``anytxt.v1.search``: the exact number of matching files.
++
++    Measured against ``filterExt`` as well, so it is the authoritative total for
++    the same (pattern, filterDir, filterExt) enumeration that paging walks.
++    ``errno`` other than 0 means the scope itself could not be searched.
++    """
++
++    total: Optional[int]
++    errno: int = ERRNO_OK
 +
 +
 +class _Budget:
@@ -392,16 +464,8 @@ index 0000000..d0fee6c
 +
 +
 +class AnyTXTClient:
-+    #: Legacy method names, kept for callers and docs that reference them.
-+    SEARCH_METHOD = API_MODES["legacy"]["search"]
-+    FRAGMENT_METHOD = API_MODES["legacy"]["fragment"]
-+
 +    def __init__(self, config: AnyTXTConfig) -> None:
 +        self.config = config
-+        spec = API_MODES[config.api_mode]
-+        self.search_method: str = spec["search"]
-+        self.fragment_method: str = spec["fragment"]
-+        self._nested_params: bool = bool(spec["nested"])
 +        self._ids = itertools.count(1)
 +        self._endpoint_gate = _endpoint_gate(config.api_url, config.max_concurrency)
 +
@@ -426,12 +490,16 @@ index 0000000..d0fee6c
 +            except TimeoutError as exc:
 +                raise AnyTXTRequestTimeout(f"AnyTXT request timed out: {exc}") from exc
 +            except HTTPError as exc:
-+                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
++                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}{_http_hint(exc)}") from exc
 +            except URLError as exc:
 +                if isinstance(exc.reason, TimeoutError):
 +                    raise AnyTXTRequestTimeout(f"AnyTXT request timed out: {exc}") from exc
++                if _is_connection_refused(exc.reason) or _is_connection_refused(exc):
++                    raise AnyTXTBackendError(_unreachable_message(self.config.api_url)) from exc
 +                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
 +            except OSError as exc:
++                if _is_connection_refused(exc):
++                    raise AnyTXTBackendError(_unreachable_message(self.config.api_url)) from exc
 +                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
 +        finally:
 +            self._endpoint_gate.release()
@@ -442,11 +510,14 @@ index 0000000..d0fee6c
 +        if not isinstance(result, dict):
 +            raise AnyTXTBackendError("AnyTXT response must be a JSON object")
 +        if result.get("error"):
-+            raise AnyTXTBackendError(f"AnyTXT RPC error: {result['error']!r}")
++            raise AnyTXTProtocolError(_protocol_error_message(result["error"]))
 +        return result
 +
 +    async def _rpc(self, method: str, params: Dict[str, Any], budget: _Budget) -> Dict[str, Any]:
-+        kind = "search" if method == self.search_method else "fragment"
++        # Only fragment lookups are gated separately: AnyTXT used to die when a
++        # GetResult and a GetFragment were in flight together.  Counting and
++        # readiness queries belong to the same search family.
++        kind = "fragment" if method == FRAGMENT_METHOD else "search"
 +        # AnyTXT answers in milliseconds but was observed to stall for seconds
 +        # under sustained load.  A stalled response is retried once while the
 +        # budget allows; connection failures are not retried because they
@@ -461,7 +532,7 @@ index 0000000..d0fee6c
 +                "jsonrpc": "2.0",
 +                "id": next(self._ids),
 +                "method": method,
-+                "params": {"input": params} if self._nested_params else params,
++                "params": params,
 +            }
 +            cancelled = threading.Event()
 +            try:
@@ -488,17 +559,9 @@ index 0000000..d0fee6c
 +        self, pattern: str, filter_dir: str, filter_ext: str, offset: int, limit: int, budget: _Budget
 +    ) -> SearchPage:
 +        result = await self._rpc(
-+            self.search_method,
-+            {
-+                "pattern": pattern,
-+                "filterDir": filter_dir,
-+                "filterExt": filter_ext,
-+                "lastModifyBegin": 0,
-+                "lastModifyEnd": 2147483647,
-+                "limit": limit,
-+                "offset": offset,
-+                "order": 0,
-+            },
++            SEARCH_METHOD,
++            _search_params(pattern, filter_dir, filter_ext, order=self.config.page_order)
++            | {"limit": limit, "offset": offset},
 +            budget,
 +        )
 +        output = _rpc_output(result)
@@ -508,22 +571,68 @@ index 0000000..d0fee6c
 +        count = output.get("count")
 +        if not isinstance(count, int) or count < 0:
 +            count = None
-+        return SearchPage(tuple(files), count)
++        return SearchPage(tuple(files), count, _rpc_errno(result))
 +
-+    async def get_fragment(self, fid: Any, pattern: str, budget: _Budget) -> str:
-+        result = await self._rpc(self.fragment_method, {"fid": fid, "pattern": pattern}, budget)
++    async def count(self, pattern: str, filter_dir: str, filter_ext: str, budget: _Budget) -> SearchTotal:
++        """Exact number of indexed files matching the same filters as paging."""
++        result = await self._rpc(
++            COUNT_METHOD,
++            _search_params(pattern, filter_dir, filter_ext),
++            budget,
++        )
++        errno = _rpc_errno(result)
++        if errno != ERRNO_OK:
++            return SearchTotal(None, errno)
++        output = _rpc_output(result)
++        if not isinstance(output, dict):
++            raise AnyTXTBackendError("AnyTXT count response is missing output")
++        total = output.get("count")
++        if not isinstance(total, int) or total < 0:
++            total = None
++        return SearchTotal(total, errno)
++
++    async def get_fragment(self, fid: Any, pattern: str, budget: _Budget) -> Optional[str]:
++        """Return the matching snippet exactly as AnyTXT sends it, or ``None``.
++
++        An unresolvable ``fid`` answers ``errno = 1`` with ``text: null`` rather
++        than a protocol error, so "no snippet" must not be mistaken for a
++        transport failure.  The returned text still carries AnyTXT's ``*<<*``
++        hit markers: decoding the wire format is this layer's job, but removing
++        presentation markup belongs to whoever builds the evidence.
++        """
++        result = await self._rpc(FRAGMENT_METHOD, {"fid": fid, "pattern": pattern}, budget)
++        if _rpc_errno(result) != ERRNO_OK:
++            return None
 +        output = _rpc_output(result)
 +        if not isinstance(output, dict):
 +            raise AnyTXTBackendError("AnyTXT fragment response is missing output")
-+        text = output.get("text", "")
++        text = output.get("text")
++        if text is None:
++            return None
 +        if not isinstance(text, str):
 +            raise AnyTXTBackendError("AnyTXT fragment text must be a string")
 +        return text
 +
++    async def status(self, budget: _Budget) -> Optional[bool]:
++        """Whether the search engine finished loading, or ``None`` if unknown."""
++        result = await self._rpc(STATUS_METHOD, {}, budget)
++        if _rpc_errno(result) != ERRNO_OK:
++            return None
++        output = _rpc_output(result)
++        if not isinstance(output, dict):
++            return None
++        ready = output.get("return")
++        return ready if isinstance(ready, bool) else None
++
 +    async def health_check(self) -> Dict[str, Any]:
 +        budget = _Budget(self.config, self.config.request_timeout)
-+        page = await self.search("zzzzanysirchmunkhealthcheck", "", "", 0, 1, budget)
-+        return {"healthy": True, "rpc_method": self.search_method, "structured": isinstance(page.files, tuple)}
++        ready = await self.status(budget)
++        return {
++            "healthy": True,
++            "rpc_method": STATUS_METHOD,
++            "engine_ready": ready,
++            "api_url": self.config.api_url,
++        }
 +
 +
 +class AnyTXTRetriever(BaseRetriever):
@@ -668,28 +777,67 @@ index 0000000..d0fee6c
 +                "AnyTXT to its own directory, so this result is not a global index search. "
 +                'Set ANYTXT_GLOBAL_ROOTS, for example ["C:\\\\", "D:\\\\", "E:\\\\"].'
 +            )
++        try:
++            ready = await self.client.status(budget)
++        except AnyTXTError as exc:
++            # Readiness is diagnostics: it must never be a reason to fail a query.
++            logger.warning("AnyTXT readiness check failed: %s", exc)
++            ready = None
++        if ready is False:
++            # The service is up but the search engine has not finished loading,
++            # so an empty answer here would be indistinguishable from "no match".
++            complete = False
++            reasons.append(ENGINE_NOT_READY_REASON)
++            logger.warning("AnyTXT reports that its search engine has not finished loading")
 +        per_term: List[Dict[str, Dict[str, Any]]] = []
 +        for term in terms:
 +            found: Dict[str, Dict[str, Any]] = {}
++            filter_ext = _file_type_glob(file_type)
 +            for scope in scopes:
++                expected: Optional[int] = None
++                if self.config.exact_count:
++                    try:
++                        total = await self.client.count(term, scope, filter_ext, budget)
++                    except AnyTXTBudgetExhausted:
++                        # Counting is an optimisation; paging still works without it.
++                        total = None
++                    if total is not None:
++                        if total.errno != ERRNO_OK:
++                            # The scope itself cannot be searched (measured: an
++                            # unindexed drive answers errno 1 with an empty
++                            # payload).  Keep what other scopes delivered, but
++                            # never let it pass as "this scope had no match".
++                            complete = False
++                            reasons.append(f"scope_errno_{total.errno}")
++                            continue
++                        expected = total.total
 +                offset = 0
++                received_total = 0
++                halt_scopes = False
 +                seen_pages: set[tuple[Any, ...]] = set()
 +                while True:
 +                    try:
-+                        page = await self.client.search(term, scope, _file_type_glob(file_type), offset, self.config.page_size, budget)
++                        page = await self.client.search(term, scope, filter_ext, offset, self.config.page_size, budget)
 +                    except AnyTXTBudgetExhausted:
 +                        # Exhausting the request budget degrades the result, it must
 +                        # not throw away the candidates already collected.
 +                        complete = False
 +                        reasons.append("budget_exhausted")
++                        halt_scopes = True
++                        break
++                    if page.errno != ERRNO_OK:
++                        complete = False
++                        reasons.append(f"scope_errno_{page.errno}")
 +                        break
 +                    signature = tuple(record.get("fid") for record in page.files)
 +                    if signature and signature in seen_pages:
 +                        complete = False
 +                        reasons.append("repeated_page")
++                        halt_scopes = True
 +                        break
 +                    seen_pages.add(signature)
-+                    valid_received = 0
++                    received_total += len(page.files)
++                    candidate_budget_hit = False
 +                    for record in page.files:
 +                        tagged_record = dict(record, _term=term)
 +                        try:
@@ -700,21 +848,28 @@ index 0000000..d0fee6c
 +                            continue
 +                        if candidate is None:
 +                            continue
-+                        valid_received += 1
 +                        key = _path_key(candidate["path"])
 +                        if key not in found:
 +                            found[key] = candidate
 +                            if sum(len(group) for group in per_term) + len(found) >= self.config.max_candidates:
 +                                complete = False
 +                                reasons.append("candidate_budget")
++                                candidate_budget_hit = True
 +                                break
-+                    if not complete and reasons[-1] == "candidate_budget":
++                    if candidate_budget_hit:
++                        halt_scopes = True
 +                        break
-+                    received = len(page.files)
-+                    if received < self.config.page_size:
++                    if expected is not None and received_total >= expected:
++                        # Every record the count promised has been delivered.
 +                        break
-+                    offset += received
-+                if not complete and reasons and reasons[-1] in {"repeated_page", "candidate_budget", "budget_exhausted"}:
++                    if len(page.files) < self.config.page_size:
++                        if expected is not None and received_total < expected:
++                            # The server promised more records than it served.
++                            complete = False
++                            reasons.append("incomplete_enumeration")
++                        break
++                    offset += len(page.files)
++                if halt_scopes:
 +                    break
 +            per_term.append(found)
 +            if "budget_exhausted" in reasons:
@@ -725,7 +880,7 @@ index 0000000..d0fee6c
 +        selected = self._combine(per_term, logic)
 +        events: List[Dict[str, Any]] = []
 +        fragment_chars = 0
-+        fragment_cache: Dict[tuple[Any, str], str] = {}
++        fragment_cache: Dict[tuple[Any, str], Optional[str]] = {}
 +        fragments_exhausted = False
 +        # Snippets are an optional enhancement: Sirchmunk reads the source file
 +        # itself.  Giving them a separate budget keeps candidate discovery from
@@ -752,7 +907,7 @@ index 0000000..d0fee6c
 +                try:
 +                    if cache_key not in fragment_cache:
 +                        fragment_cache[cache_key] = await self.client.get_fragment(candidate["fid"], term, fragment_budget)
-+                    text = fragment_cache[cache_key]
++                    raw_text = fragment_cache[cache_key]
 +                except AnyTXTBudgetExhausted:
 +                    # Keep every candidate that was already discovered.
 +                    complete = False
@@ -763,6 +918,16 @@ index 0000000..d0fee6c
 +                    complete = False
 +                    reasons.append("fragment_failure")
 +                    continue
++                if raw_text is None:
++                    # The index cannot resolve this record even though the file
++                    # exists (measured: errno 1 with ``text: null``).  The
++                    # candidate is still valid, only its snippet is lost.
++                    complete = False
++                    reasons.append("fragment_unavailable")
++                    continue
++                # AnyTXT marks hits with ``*<<*``/``*>>*``; that is presentation
++                # markup and must not become part of the evidence.
++                text = strip_highlight_markers(raw_text)
 +                if len(text) > remaining:
 +                    complete = False
 +                    reasons.append("fragment_budget")
@@ -916,6 +1081,79 @@ index 0000000..d0fee6c
 +        for index in range(max(lengths, default=0)):
 +            result.append({name: column[index] for name, column in value.items() if isinstance(column, list) and index < len(column)})
 +    return result
++
++
++def _search_params(
++    pattern: str, filter_dir: str, filter_ext: str, *, order: Optional[int] = None
++) -> Dict[str, Any]:
++    """Shared parameter block of ``anytxt.v1.search``/``getResult``.
++
++    v1 takes the parameters directly in ``params`` (no ``input`` wrapper) and
++    ``lastModifyEnd: 0`` means "no upper bound".
++    """
++    params: Dict[str, Any] = {
++        "pattern": pattern,
++        "filterDir": filter_dir,
++        "filterExt": filter_ext,
++        "lastModifyBegin": 0,
++        "lastModifyEnd": 0,
++    }
++    if order is not None:
++        params["order"] = order
++    return params
++
++
++def _rpc_errno(response: Dict[str, Any]) -> int:
++    """AnyTXT business status; a missing value is treated as success."""
++    result = response.get("result")
++    if isinstance(result, dict):
++        errno = result.get("errno")
++        if isinstance(errno, int):
++            return errno
++    return ERRNO_OK
++
++
++def strip_highlight_markers(text: str) -> str:
++    """Remove AnyTXT's ``*<<*``/``*>>*`` hit markers from a fragment."""
++    if HIGHLIGHT_OPEN not in text and HIGHLIGHT_CLOSE not in text:
++        return text
++    return text.replace(HIGHLIGHT_OPEN, "").replace(HIGHLIGHT_CLOSE, "")
++
++
++def _is_connection_refused(exc: Any) -> bool:
++    if exc is None:
++        return False
++    if isinstance(exc, ConnectionRefusedError):
++        return True
++    return getattr(exc, "winerror", None) == 10061
++
++
++def _unreachable_message(api_url: str) -> str:
++    return (
++        f"AnyTXT is not accepting connections at {api_url}. AnySirchmunk requires "
++        "AnyTXT Searcher 1.3.3541 or newer, running, with the local API enabled "
++        "(the legacy 9920 interface is no longer supported)."
++    )
++
++
++def _http_hint(exc: HTTPError) -> str:
++    hints = {
++        400: " (the request headers were rejected; Accept and Content-Type: application/json are both required)",
++        403: " (AnyTXT rejects requests with a non-loopback Host or Origin header)",
++        404: " (the RPC path is wrong; the v1 endpoint is http://127.0.0.1:9924/rpc)",
++    }
++    return hints.get(getattr(exc, "code", None), "")
++
++
++def _protocol_error_message(error: Any) -> str:
++    code = error.get("code") if isinstance(error, dict) else None
++    message = error.get("message") if isinstance(error, dict) else None
++    detail = f"{code}: {message}" if code is not None else repr(error)
++    if code == -32601:
++        return f"AnyTXT RPC error {detail} — this build does not expose the anytxt.v1 method (1.3.3541+ required)"
++    if code == -32602:
++        return f"AnyTXT RPC error {detail} — the adapter sent a parameter this AnyTXT build rejects"
++    return f"AnyTXT RPC error {detail}"
 +
 +
 +def _rpc_output(response: Dict[str, Any]) -> Any:

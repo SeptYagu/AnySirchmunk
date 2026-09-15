@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
 
 MODULE_PATH = Path(__file__).parents[1] / "src" / "sirchmunk" / "retrieve" / "anytxt_retriever.py"
@@ -18,17 +19,41 @@ SPEC.loader.exec_module(mod)
 
 
 class FakeClient:
-    def __init__(self, pages, fragments=None):
+    def __init__(self, pages, fragments=None, totals=None, ready=True, errnos=None):
         self.pages = pages
         self.fragments = fragments or {}
+        #: ``(pattern, filter_dir) -> total rows`` or an explicit SearchTotal.
+        #: Missing keys report "unknown", which keeps the paging heuristic in use.
+        self.totals = totals or {}
+        #: ``(pattern, filter_dir) -> errno`` for *paging* requests; a non-zero
+        #: value models a scope AnyTXT cannot search (measured: an unindexed
+        #: drive answers errno 1 with an empty payload).
+        self.errnos = errnos or {}
+        self.ready = ready
         self.search_calls = []
         self.fragment_calls = []
+        self.count_calls = []
+        self.status_calls = 0
 
     async def search(self, pattern, filter_dir, filter_ext, offset, limit, budget):
         budget.charge()
         self.search_calls.append((pattern, filter_dir, filter_ext, offset, limit))
         rows, count = self.pages.get((pattern, filter_dir, offset), ([], 0))
-        return mod.SearchPage(tuple(rows), count)
+        errno = self.errnos.get((pattern, filter_dir), mod.ERRNO_OK)
+        return mod.SearchPage(tuple(rows), count, errno)
+
+    async def count(self, pattern, filter_dir, filter_ext, budget):
+        budget.charge()
+        self.count_calls.append((pattern, filter_dir, filter_ext))
+        value = self.totals.get((pattern, filter_dir), mod.SearchTotal(None, mod.ERRNO_OK))
+        if isinstance(value, int):
+            return mod.SearchTotal(value, mod.ERRNO_OK)
+        return value
+
+    async def status(self, budget):
+        budget.charge()
+        self.status_calls += 1
+        return self.ready
 
     async def get_fragment(self, fid, pattern, budget):
         budget.charge()
@@ -54,7 +79,7 @@ class FakeFallback:
 
 
 def config(**kwargs):
-    values = dict(api_mode="legacy", api_url="http://127.0.0.1:9920",
+    values = dict(api_url="http://127.0.0.1:9924/rpc",
                   page_size=2, request_timeout=1, total_timeout=10, max_concurrency=2,
                   max_requests=30, max_candidates=30, max_fragment_chars=1000,
                   fallback_to_rga=True, fallback_roots=(), global_roots=())
@@ -81,11 +106,32 @@ class ConfigTests(unittest.TestCase):
         # patterns; concurrency 2 is the highest value verified safe.
         self.assertEqual(mod.AnyTXTConfig().max_concurrency, 2)
 
-    def test_environment_defaults_pair_v1_with_its_documented_endpoint(self):
+    def test_environment_defaults_target_the_v1_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
             parsed = mod.AnyTXTConfig.from_env()
-        self.assertEqual(parsed.api_mode, "v1")
         self.assertEqual(parsed.api_url, "http://127.0.0.1:9924/rpc")
+
+    def test_legacy_mode_is_rejected_instead_of_silently_ignored(self):
+        # A leftover ANYTXT_API_MODE=legacy in an operator's .env must fail
+        # loudly: answering through a different API than the configured one is
+        # exactly the kind of silent semantic change this project forbids.
+        with patch.dict(os.environ, {"ANYTXT_API_MODE": "legacy"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "no longer supported"):
+                mod.AnyTXTConfig.from_env()
+        with patch.dict(os.environ, {"ANYTXT_API_MODE": "v1"}, clear=True):
+            self.assertEqual(mod.AnyTXTConfig.from_env().api_url, "http://127.0.0.1:9924/rpc")
+
+    def test_page_size_outside_the_documented_v1_range_is_rejected(self):
+        # AnyTXT v1 answers -32602 for limit outside [1, 300]; catching it at
+        # configuration time turns a mid-query protocol error into a start-up
+        # message.
+        for value in ("0", "301"):
+            with self.subTest(limit=value):
+                with patch.dict(os.environ, {"ANYTXT_SEARCH_LIMIT": value}, clear=True):
+                    with self.assertRaisesRegex(ValueError, "ANYTXT_SEARCH_LIMIT"):
+                        mod.AnyTXTConfig.from_env()
+        with patch.dict(os.environ, {"ANYTXT_SEARCH_LIMIT": "300"}, clear=True):
+            self.assertEqual(mod.AnyTXTConfig.from_env().page_size, 300)
 
     def test_accepts_existing_absolute_fallback_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,8 +336,10 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
             ("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}, {"fid": "2", "file": r"D:\lib\b.pdf"}], 2),
             ("alpha", root, 2): ([{"fid": "3", "file": r"D:\lib\c.pdf"}], 1),
         }
+        # Three requests fit (readiness, the exact count and the first page); the
+        # second page does not.
         retriever = mod.AnyTXTRetriever(
-            config=config(page_size=2, max_requests=1, global_roots=(root,)), client=FakeClient(pages)
+            config=config(page_size=2, max_requests=3, global_roots=(root,)), client=FakeClient(pages)
         )
         events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
         self.assertFalse(events.metadata["complete"])
@@ -373,6 +421,156 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("budget_exhausted", events.metadata["reason"])
 
 
+    async def test_unsearchable_scope_is_reported_and_other_roots_survive(self):
+        # Measured on 1.3.3541: filterDir pointing at an unindexed volume answers
+        # errno 1 with an empty payload.  Treating that as "no match" would
+        # silently drop a whole drive while still claiming completeness.
+        good, bad = r"D:\lib", r"Z:\nowhere"
+        pages = {
+            ("alpha", good, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1),
+        }
+        client = FakeClient(pages, errnos={("alpha", bad): 1})
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=3, global_roots=(good, bad)), client=client
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(
+            [event["data"]["path"]["text"] for event in events if event["type"] == "begin"],
+            [r"D:\lib\a.pdf"],
+        )
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("scope_errno_1", events.metadata["reason"])
+
+    async def test_count_errno_skips_the_scope_without_paging_it(self):
+        bad = r"Z:\nowhere"
+        client = FakeClient({}, totals={("alpha", bad): mod.SearchTotal(None, 1)})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=3, global_roots=(bad,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(list(events), [])
+        self.assertEqual(client.search_calls, [])
+        self.assertIn("scope_errno_1", events.metadata["reason"])
+
+    async def test_exact_count_ends_paging_once_every_row_is_delivered(self):
+        root = r"D:\lib"
+        rows = [{"fid": "1", "file": r"D:\lib\a.pdf"}, {"fid": "2", "file": r"D:\lib\b.pdf"}]
+        pages = {
+            ("alpha", root, 0): (rows, 2),
+            # The server would happily serve another page; the exact count says
+            # there is nothing left, so that request must never be sent.
+            ("alpha", root, 2): ([{"fid": "3", "file": r"D:\lib\c.pdf"}], 1),
+        }
+        client = FakeClient(pages, totals={("alpha", root): 2})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual([call[3] for call in client.search_calls], [0])
+        self.assertEqual(len([event for event in events if event["type"] == "begin"]), 2)
+        self.assertTrue(events.metadata["complete"])
+        self.assertIsNone(events.metadata["reason"])
+
+    async def test_short_page_below_the_exact_count_is_marked_incomplete(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1)}
+        client = FakeClient(pages, totals={("alpha", root): 5})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("incomplete_enumeration", events.metadata["reason"])
+
+    async def test_unknown_total_falls_back_to_the_paging_heuristic(self):
+        # Without a count the adapter must keep working, and must not invent a
+        # completeness verdict it cannot support.
+        root = r"D:\lib"
+        pages = {
+            ("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}, {"fid": "2", "file": r"D:\lib\b.pdf"}], 2),
+            ("alpha", root, 2): ([{"fid": "3", "file": r"D:\lib\c.pdf"}], 1),
+        }
+        client = FakeClient(pages)
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual([call[3] for call in client.search_calls], [0, 2])
+        self.assertEqual(len([event for event in events if event["type"] == "begin"]), 3)
+        self.assertTrue(events.metadata["complete"])
+
+    async def test_unavailable_fragment_keeps_the_candidate(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1)}
+        client = FakeClient(pages, fragments={("1", "alpha"): None})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual([event["data"]["path"]["text"] for event in events if event["type"] == "begin"],
+                         [r"D:\lib\a.pdf"])
+        self.assertEqual([event["data"]["lines"]["text"] for event in events if event["type"] == "match"], [""])
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("fragment_unavailable", events.metadata["reason"])
+
+    async def test_engine_not_ready_is_reported_without_dropping_candidates(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1)}
+        client = FakeClient(pages, totals={("alpha", root): 1}, ready=False)
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(len([event for event in events if event["type"] == "begin"]), 1)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn(mod.ENGINE_NOT_READY_REASON, events.metadata["reason"])
+
+    async def test_readiness_failure_never_fails_the_query(self):
+        class BrokenStatus(FakeClient):
+            async def status(self, budget):
+                raise mod.AnyTXTBackendError("status endpoint is missing")
+
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1)}
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=2, global_roots=(root,)),
+            client=BrokenStatus(pages, totals={("alpha", root): 1}),
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(len([event for event in events if event["type"] == "begin"]), 1)
+        self.assertTrue(events.metadata["complete"])
+
+    async def test_highlight_markers_never_reach_the_evidence(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1)}
+        client = FakeClient(pages, fragments={("1", "alpha"): "see *<<*alpha*>>* here"},
+                            totals={("alpha", root): 1})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2, global_roots=(root,)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        snippets = [event["data"]["lines"]["text"] for event in events if event["type"] == "match"]
+        self.assertEqual(snippets[0], "see alpha here")
+
+    def test_highlight_stripping_leaves_plain_text_alone(self):
+        self.assertEqual(mod.strip_highlight_markers("no markers"), "no markers")
+        self.assertEqual(mod.strip_highlight_markers(""), "")
+        self.assertEqual(mod.strip_highlight_markers("*<<*a*>>*b"), "ab")
+
+    async def test_page_order_is_configurable_and_defaults_to_path_ascending(self):
+        self.assertEqual(mod.AnyTXTConfig().page_order, 3)
+        captured = {}
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return b'{"result": {"errno": 0, "data": {"output": {"count": 0, "field": [], "files": []}}}}'
+
+        def fake_urlopen(request, timeout=None):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return _Response()
+
+        client = mod.AnyTXTClient(config(page_order=4))
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
+        self.assertEqual(captured["payload"]["params"]["order"], 4)
+        # A count must not carry paging parameters at all.
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await client.count("alpha", "", "", mod._Budget(config(), 5))
+        self.assertNotIn("order", captured["payload"]["params"])
+
+
 class RpcContractTests(unittest.IsolatedAsyncioTestCase):
     """The local service rejects requests which miss either required header."""
 
@@ -389,20 +587,10 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
         def read(self) -> bytes:
             return self._body
 
-    def _capture(self, body: bytes):
-        captured = {}
-
-        def fake_urlopen(request, timeout=None):
-            captured["request"] = request
-            captured["timeout"] = timeout
-            return self._Response(body)
-
-        return captured, fake_urlopen
-
     async def test_search_sends_jsonrpc_envelope_and_required_headers(self):
-        body = b'{"result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+        body = b'{"result": {"errno": 0, "data": {"output": {"count": 0, "field": [], "files": []}}}}'
         captured, fake_urlopen = self._capture(body)
-        client = mod.AnyTXTClient(config())
+        client = mod.AnyTXTClient(config(page_size=5))
         with patch.object(mod, "urlopen", fake_urlopen):
             await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
 
@@ -414,21 +602,95 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["jsonrpc"], "2.0")
         self.assertIn("id", payload)
-        self.assertEqual(payload["method"], mod.AnyTXTClient.SEARCH_METHOD)
-        self.assertEqual(payload["params"]["input"]["pattern"], "alpha")
-        self.assertEqual(payload["params"]["input"]["filterDir"], "")
+        self.assertEqual(payload["method"], mod.SEARCH_METHOD)
+        # v1 takes the parameters directly in params; wrapping them in "input"
+        # is the removed legacy shape.
+        self.assertNotIn("input", payload["params"])
+        self.assertEqual(payload["params"]["pattern"], "alpha")
+        self.assertEqual(payload["params"]["filterDir"], "")
+        self.assertEqual(payload["params"]["order"], 3)
+        self.assertEqual(payload["params"]["offset"], 0)
+        self.assertEqual(payload["params"]["limit"], 5)
 
-    async def test_fragment_uses_jsonrpc_envelope(self):
-        body = b'{"result": {"data": {"output": {"text": "snippet"}}}}'
+    async def test_count_uses_the_documented_method_and_filters(self):
+        body = b'{"result": {"errno": 0, "data": {"output": {"count": 77}}}}'
+        captured, fake_urlopen = self._capture(body)
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            total = await client.count("alpha", r"D:\\docs", "*.pdf", mod._Budget(config(), 5))
+
+        self.assertEqual(total.total, 77)
+        self.assertEqual(total.errno, mod.ERRNO_OK)
+        payload = json.loads(captured["request"].data.decode("utf-8"))
+        self.assertEqual(payload["method"], mod.COUNT_METHOD)
+        self.assertEqual(payload["params"]["filterDir"], r"D:\\docs")
+        self.assertEqual(payload["params"]["filterExt"], "*.pdf")
+        # A count must describe the exact same enumeration as paging, so it may
+        # not carry paging-only parameters.
+        self.assertNotIn("limit", payload["params"])
+        self.assertNotIn("offset", payload["params"])
+
+    async def test_fragment_returns_the_wire_text_unchanged(self):
+        # Stripping the ``*<<*`` hit markers happens where the evidence is built,
+        # not here: this layer only decodes the wire format.
+        body = '{"result": {"errno": 0, "data": {"output": {"text": "a *<<*hit*>>* here"}}}}'.encode()
         captured, fake_urlopen = self._capture(body)
         client = mod.AnyTXTClient(config())
         with patch.object(mod, "urlopen", fake_urlopen):
             text = await client.get_fragment("fid-1", "alpha", mod._Budget(config(), 5))
 
-        self.assertEqual(text, "snippet")
+        self.assertEqual(text, "a *<<*hit*>>* here")
         payload = json.loads(captured["request"].data.decode("utf-8"))
-        self.assertEqual(payload["method"], mod.AnyTXTClient.FRAGMENT_METHOD)
-        self.assertEqual(payload["params"]["input"], {"fid": "fid-1", "pattern": "alpha"})
+        self.assertEqual(payload["method"], mod.FRAGMENT_METHOD)
+        self.assertEqual(payload["params"], {"fid": "fid-1", "pattern": "alpha"})
+
+    async def test_unresolvable_fragment_reports_none_instead_of_an_error(self):
+        # Measured on 1.3.3541: an unresolvable fid answers errno 1 with
+        # text: null, so "no snippet" must not look like a transport failure.
+        for body in (
+            b'{"result": {"errno": 1, "data": {"output": {"text": null}}}}',
+            b'{"result": {"errno": 0, "data": {"output": {"text": null}}}}',
+        ):
+            with self.subTest(body=body):
+                client = mod.AnyTXTClient(config())
+                _, fake_urlopen = self._capture(body)
+                with patch.object(mod, "urlopen", fake_urlopen):
+                    self.assertIsNone(await client.get_fragment("1", "alpha", mod._Budget(config(), 5)))
+
+    async def test_json_rpc_error_codes_are_classified(self):
+        for code, expected in ((-32601, "anytxt.v1 method"), (-32602, "parameter")):
+            with self.subTest(code=code):
+                body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                                   "error": {"code": code, "message": "nope"}}).encode()
+                client = mod.AnyTXTClient(config())
+                _, fake_urlopen = self._capture(body)
+                with patch.object(mod, "urlopen", fake_urlopen):
+                    with self.assertRaises(mod.AnyTXTProtocolError) as caught:
+                        await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
+                self.assertIn(expected, str(caught.exception))
+                self.assertIn(str(code), str(caught.exception))
+
+    async def test_unreachable_service_names_the_required_version_and_endpoint(self):
+        def refused(request, timeout=None):
+            raise URLError(ConnectionRefusedError(10061, "connection refused"))
+
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", refused):
+            with self.assertRaises(mod.AnyTXTBackendError) as caught:
+                await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
+        message = str(caught.exception)
+        self.assertIn("1.3.3541", message)
+        self.assertIn("9924/rpc", message)
+
+    def _capture(self, body: bytes):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return self._Response(body)
+
+        return captured, fake_urlopen
 
 
 class ConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
@@ -545,10 +807,10 @@ class ConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(peak[0], 2)
 
 
-class ApiModeTests(unittest.IsolatedAsyncioTestCase):
-    """v1 is the default endpoint; legacy stays available for older builds."""
+class V1EndpointTests(unittest.IsolatedAsyncioTestCase):
+    """Only the documented v1 surface is supported."""
 
-    SEARCH_BODY = b'{"jsonrpc": "2.0", "result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+    SEARCH_BODY = b'{"jsonrpc": "2.0", "result": {"errno": 0, "data": {"output": {"count": 0, "field": [], "files": []}}}}'
 
     class _Response:
         def __init__(self, body: bytes) -> None:
@@ -563,50 +825,54 @@ class ApiModeTests(unittest.IsolatedAsyncioTestCase):
         def read(self) -> bytes:
             return self._body
 
-    def _capture(self):
+    def _capture(self, body: bytes = None):
         captured = {}
 
         def fake_urlopen(request, timeout=None):
             captured["request"] = request
-            return self._Response(self.SEARCH_BODY)
+            return self._Response(body if body is not None else self.SEARCH_BODY)
 
         return captured, fake_urlopen
 
-    def test_default_mode_targets_the_documented_endpoint(self):
+    def test_default_client_uses_the_v1_endpoint_and_methods(self):
         parsed = mod.AnyTXTConfig()
-        self.assertEqual(parsed.api_mode, "v1")
         self.assertEqual(parsed.api_url, "http://127.0.0.1:9924/rpc")
-        client = mod.AnyTXTClient(parsed)
-        self.assertEqual(client.search_method, "anytxt.v1.getResult")
-        self.assertEqual(client.fragment_method, "anytxt.v1.getFragment")
+        payload = mod._search_params("alpha", "", "")
+        self.assertEqual(mod.SEARCH_METHOD, "anytxt.v1.getResult")
+        self.assertEqual(mod.COUNT_METHOD, "anytxt.v1.search")
+        self.assertEqual(mod.FRAGMENT_METHOD, "anytxt.v1.getFragment")
+        self.assertEqual(mod.STATUS_METHOD, "anytxt.v1.status")
+        self.assertNotIn("input", payload)
 
-    async def test_v1_places_parameters_directly_in_params(self):
+    async def test_requests_go_to_the_configured_v1_url(self):
         captured, fake_urlopen = self._capture()
-        client = mod.AnyTXTClient(config(api_mode="v1", api_url="http://127.0.0.1:9924/rpc"))
+        client = mod.AnyTXTClient(config(api_url="http://127.0.0.1:9924/rpc"))
         with patch.object(mod, "urlopen", fake_urlopen):
             await client.search("alpha", "C:\\", "", 0, 5, mod._Budget(config(), 5))
-        request = captured["request"]
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(request.full_url, "http://127.0.0.1:9924/rpc")
-        self.assertEqual(payload["method"], "anytxt.v1.getResult")
-        self.assertNotIn("input", payload["params"])
-        self.assertEqual(payload["params"]["pattern"], "alpha")
+        self.assertEqual(captured["request"].full_url, "http://127.0.0.1:9924/rpc")
+        self.assertEqual(json.loads(captured["request"].data.decode("utf-8"))["method"], "anytxt.v1.getResult")
 
-    async def test_legacy_keeps_the_input_envelope(self):
-        captured, fake_urlopen = self._capture()
+    async def test_health_check_reads_the_engine_state_from_status(self):
+        body = b'{"jsonrpc": "2.0", "id": 1, "result": {"errno": 0, "data": {"input": {}, "output": {"return": true}}}}'
+        captured, fake_urlopen = self._capture(body)
         client = mod.AnyTXTClient(config())
         with patch.object(mod, "urlopen", fake_urlopen):
-            await client.search("alpha", "C:\\", "", 0, 5, mod._Budget(config(), 5))
-        request = captured["request"]
-        payload = json.loads(request.data.decode("utf-8"))
-        self.assertEqual(request.full_url, "http://127.0.0.1:9920")
-        self.assertEqual(payload["method"], "ATRpcServer.Searcher.V1.GetResult")
-        self.assertEqual(payload["params"]["input"]["pattern"], "alpha")
+            health = await client.health_check()
+        self.assertEqual(
+            json.loads(captured["request"].data.decode("utf-8"))["method"], mod.STATUS_METHOD
+        )
+        self.assertEqual(health["rpc_method"], mod.STATUS_METHOD)
+        self.assertTrue(health["engine_ready"])
+        self.assertEqual(health["api_url"], "http://127.0.0.1:9924/rpc")
 
-    def test_invalid_api_mode_is_rejected(self):
-        with patch.dict(os.environ, {"ANYTXT_API_MODE": "v2"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "ANYTXT_API_MODE"):
-                mod.AnyTXTConfig.from_env()
+    async def test_status_false_is_reported_as_not_ready(self):
+        body = b'{"jsonrpc": "2.0", "id": 1, "result": {"errno": 0, "data": {"input": {}, "output": {"return": false}}}}'
+        _, fake_urlopen = self._capture(body)
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            health = await client.health_check()
+        self.assertTrue(health["healthy"])
+        self.assertFalse(health["engine_ready"])
 
 
 class TimeoutRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -679,15 +945,36 @@ class TimeoutRetryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeliveryArtifactTests(unittest.TestCase):
-    def test_patch_templates_use_the_safe_v1_defaults(self):
-        patch_text = (MODULE_PATH.parents[3] / "patches" / "sirchmunk-3c7ee54-anytxt.patch").read_text(
-            encoding="utf-8"
-        )
-        self.assertEqual(patch_text.count("+ANYTXT_API_MODE=v1"), 2)
+    """The shipped patch is what an operator actually installs."""
+
+    PATCH = MODULE_PATH.parents[3] / "patches" / "sirchmunk-3c7ee54-anytxt.patch"
+
+    def test_patch_templates_carry_the_v1_defaults_and_no_legacy_surface(self):
+        patch_text = self.PATCH.read_text(encoding="utf-8")
+        # Both delivered templates (config/env.example and the CLI's .env writer)
+        # must agree; a count of 2 is what makes that checkable.
         self.assertEqual(patch_text.count("+ANYTXT_API_URL=http://127.0.0.1:9924/rpc"), 2)
         self.assertEqual(patch_text.count("+ANYTXT_MAX_CONCURRENCY=2"), 2)
         self.assertEqual(patch_text.count("+ANYTXT_MAX_FRAGMENT_REQUESTS=100"), 2)
-        self.assertNotIn("+ANYTXT_MAX_CONCURRENCY=4", patch_text)
+        self.assertEqual(patch_text.count("+ANYTXT_PAGE_ORDER=3"), 2)
+        self.assertEqual(patch_text.count("+ANYTXT_EXACT_COUNT=true"), 2)
+        # No delivered template may offer the removed knobs or point at the
+        # removed endpoint.  Leading "+" keeps this about the added lines only,
+        # so the adapter explaining the removal is still allowed.
+        for removed in ("+ANYTXT_API_MODE", "+ANYTXT_MAX_CONCURRENCY=4",
+                        "+ANYTXT_API_URL=http://127.0.0.1:9920",
+                        "ATRpcServer.Searcher.V1.GetResult", "ATRpcServer.Searcher.V1.GetFragment"):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, patch_text)
+
+    def test_patch_installs_the_v1_only_adapter(self):
+        patch_text = self.PATCH.read_text(encoding="utf-8")
+        self.assertIn("+SEARCH_METHOD = \"anytxt.v1.getResult\"", patch_text)
+        self.assertNotIn("+API_MODES", patch_text)
+        for path in ("config/env.example", "src/sirchmunk/agentic/tools.py", "src/sirchmunk/cli/cli.py",
+                     "src/sirchmunk/retrieve/anytxt_retriever.py", "src/sirchmunk/search.py"):
+            with self.subTest(path=path):
+                self.assertIn(f"diff --git a/{path}", patch_text)
 
 
 if __name__ == "__main__":

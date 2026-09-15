@@ -33,6 +33,15 @@ except ImportError:  # Allows the adapter's contract tests to run standalone.
 logger = logging.getLogger(__name__)
 PathLike = Union[str, Path]
 
+#: Two headers are mandatory.  Without both of them the local service answers
+#: HTTP 400 with an empty body, so they are part of the compatibility contract.
+RPC_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+
+#: ``filterDir=""`` is *not* a global search.  AnyTXT resolves the empty value to
+#: its own current directory (observed: ``C:``) and returns that drive only.
+SERVER_DEFAULT_SCOPE = "anytxt_server_default"
+UNVERIFIED_GLOBAL_REASON = "unverified_global_scope"
+
 
 class AnyTXTError(RuntimeError):
     """Base class for failures which may trigger a bounded rga fallback."""
@@ -82,6 +91,10 @@ class AnyTXTConfig:
     max_fragment_chars: int = 100000
     fallback_to_rga: bool = True
     fallback_roots: tuple[str, ...] = ()
+    #: Roots used for "no explicit range" queries.  An empty value means the
+    #: unverified server default directory is used and the result is reported as
+    #: incomplete instead of pretending to be a global index search.
+    global_roots: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "AnyTXTConfig":
@@ -110,6 +123,7 @@ class AnyTXTConfig:
             if not os.path.isdir(root):
                 raise ValueError(f"ANYTXT_FALLBACK_ROOTS is not an existing directory: {item!r}")
             roots.append(root)
+        global_roots = _env_roots("ANYTXT_GLOBAL_ROOTS", os.getenv("ANYTXT_GLOBAL_ROOTS", "[]"))
 
         api_url = os.getenv("ANYTXT_API_URL", cls.api_url)
         parsed = urlparse(api_url)
@@ -129,6 +143,7 @@ class AnyTXTConfig:
             max_fragment_chars=positive("ANYTXT_MAX_FRAGMENT_CHARS", "100000", int),
             fallback_to_rga=fallback in {"true", "1", "yes"},
             fallback_roots=tuple(roots),
+            global_roots=tuple(global_roots),
         )
 
 
@@ -168,7 +183,7 @@ class AnyTXTClient:
         request = Request(
             self.config.api_url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            headers=dict(RPC_HEADERS),
             method="POST",
         )
         try:
@@ -362,10 +377,26 @@ class AnyTXTRetriever(BaseRetriever):
         include: Optional[List[str]], exclude: Optional[List[str]], file_type: Optional[str], timeout: float,
     ) -> RetrievalEvents:
         budget = _Budget(self.config, timeout)
-        scopes = roots or [""]
-        per_term: List[Dict[str, Dict[str, Any]]] = []
         complete = True
         reasons: List[str] = []
+        # "No explicit range" cannot be expressed as an empty filterDir: the
+        # service resolves it to its own default directory and returns that
+        # drive only, which silently drops every other indexed volume.
+        scope_roots = roots or list(self.config.global_roots)
+        if scope_roots:
+            scopes: List[str] = scope_roots
+            effective_scope: Any = scope_roots
+        else:
+            scopes = [""]
+            effective_scope = SERVER_DEFAULT_SCOPE
+            complete = False
+            reasons.append(UNVERIFIED_GLOBAL_REASON)
+            logger.warning(
+                "ANYTXT_GLOBAL_ROOTS is not configured. An empty filterDir is resolved by "
+                "AnyTXT to its own directory, so this result is not a global index search. "
+                'Set ANYTXT_GLOBAL_ROOTS, for example ["C:\\\\", "D:\\\\", "E:\\\\"].'
+            )
+        per_term: List[Dict[str, Dict[str, Any]]] = []
         for term in terms:
             found: Dict[str, Dict[str, Any]] = {}
             for scope in scopes:
@@ -382,7 +413,7 @@ class AnyTXTRetriever(BaseRetriever):
                     valid_received = 0
                     for record in page.files:
                         tagged_record = dict(record, _term=term)
-                        candidate = self._candidate(tagged_record, roots, max_depth, include, exclude)
+                        candidate = self._candidate(tagged_record, scope_roots, max_depth, include, exclude)
                         if candidate is None:
                             continue
                         valid_received += 1
@@ -445,7 +476,7 @@ class AnyTXTRetriever(BaseRetriever):
                     "_anytxt": {name: candidate[name] for name in ("fid", "lastModify", "size") if name in candidate},
                 })
             events.append({"type": "end", "data": common, "_search_backend": "anytxt"})
-        metadata = self._metadata(complete, not complete, ",".join(dict.fromkeys(reasons)) or None, roots)
+        metadata = self._metadata(complete, not complete, ",".join(dict.fromkeys(reasons)) or None, effective_scope)
         metadata.update({"requests": budget.requests, "candidates": len(selected), "fragment_chars": fragment_chars})
         for event in events:
             event["_retrieval_metadata"] = metadata
@@ -528,15 +559,17 @@ class AnyTXTRetriever(BaseRetriever):
         logger.warning("AnyTXT search fell back to rga: %s", error)
         return events
 
-    @staticmethod
-    def _metadata(complete: bool, truncated: bool, reason: Optional[str], scope: Any) -> Dict[str, Any]:
-        roots = _normalise_roots(scope)
+    def _metadata(self, complete: bool, truncated: bool, reason: Optional[str], scope: Any) -> Dict[str, Any]:
+        if isinstance(scope, str):
+            effective_scope: Any = scope
+        else:
+            effective_scope = _normalise_roots(scope) or list(self.config.global_roots) or SERVER_DEFAULT_SCOPE
         return {
             "complete": complete,
             "truncated": truncated,
             "reason": reason,
             "actual_backend": "anytxt",
-            "effective_scope": roots or "global_index",
+            "effective_scope": effective_scope,
             "scope_reduced": False,
         }
 
@@ -586,6 +619,25 @@ def _absolute_path(value: str) -> str:
             return str(Path(value).expanduser().resolve(strict=False))
         return ntpath.normpath(value)
     return str(Path(value).expanduser().resolve())
+
+
+def _env_roots(name: str, raw: str) -> List[str]:
+    """Parse a JSON array of existing absolute directories from the environment."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be a JSON array") from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{name} must be a JSON array of absolute paths")
+    roots: List[str] = []
+    for item in value:
+        if not _is_absolute_path(item):
+            raise ValueError(f"{name} contains a non-absolute path: {item!r}")
+        root = _absolute_path(item)
+        if not os.path.isdir(root):
+            raise ValueError(f"{name} is not an existing directory: {item!r}")
+        roots.append(root)
+    return roots
 
 
 def _normalise_roots(path: Any) -> List[str]:

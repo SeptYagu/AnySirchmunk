@@ -116,11 +116,11 @@ class AnyTXTRetriever(BaseRetriever):
 }
 ```
 
-匹配文本从响应的 `output.text` 读取。
+匹配文本从响应的 `output.text` 读取。请求必须使用 JSON-RPC 2.0 信封（`params.input`），并同时带 `Accept: application/json` 和 `Content-Type: application/json`；缺少任一头部时服务端返回 `HTTP 400`，裸 `{"method": ..., "input": ...}` 形式则不会得到响应。
 
-RPC 地址、请求限制和超时都由配置提供。未显式指定搜索范围时，使用空 `filterDir` 查询 AnyTXT 全局索引。用户明确指定一个或多个根目录时，每个根目录分别请求，结果再按规范化后的绝对路径去重。
+RPC 地址、请求限制和超时都由配置提供。用户明确指定一个或多个根目录时，每个根目录分别请求，结果再按规范化后的绝对路径去重。
 
-本机 1.3.2477 实测中，空字符串可以全局搜索，`"*"` 返回零结果；官方论坛示例则使用 `"*"`。这属于 Beta API 的版本或环境差异，不能把论坛示例直接硬编码。详细记录见 [anytxt-capabilities.md](anytxt-capabilities.md)。
+2026-09-15 复核发现空 `filterDir` 并不是全局搜索：服务端把它解析为自己的当前目录（实测为 `C:`），只返回该卷的结果。因此“未显式指定范围”由 `ANYTXT_GLOBAL_ROOTS` 声明的根目录集合逐根查询并合并；未配置时仍发送空 `filterDir`，但结果必须标记为不完整（`complete=false`、`reason=unverified_global_scope`、`effective_scope=anytxt_server_default`）并输出告警，不得冒称全局索引结果。RPC 没有可列出已索引卷的方法，卷列表只能由配置提供、不做磁盘猜测。本机 1.3.2477 中 `"*"` 返回零结果，官方论坛示例不能硬编码。详细记录见 [anytxt-capabilities.md](anytxt-capabilities.md)。
 
 ### 4.3 事件转换
 
@@ -161,7 +161,7 @@ AnyTXT 片段没有可靠行号时不伪造 `line_number`。上述事件为目�
 | Sirchmunk 参数 | AnyTXT/适配层行为 |
 | --- | --- |
 | `terms` | 单词按已验证的 literal/regex 语义搜索；多个词按已确认的 `logic` 语义组合 |
-| `path` | 未明确限定时使用空 `filterDir` 全局搜索；明确限定时每个根目录对应一次请求 |
+| `path` | 未明确限定时按 `ANYTXT_GLOBAL_ROOTS` 逐根查询并合并；未配置时退化为服务端默认目录并标记不完整。明确限定时每个根目录对应一次请求 |
 | `case_sensitive` | 仅在原生语义已验证或完整文本可等价验证时支持；否则按范围契约回退或报不支持 |
 | `literal` | 使用经过正反例验证的字面量编码；未确认转义规则时，不直接传入含正则符号的词 |
 | `regex` | 仅支持已验证的语法子集；未知或不兼容时按范围契约回退或报不支持，不降级为普通词 |
@@ -214,10 +214,10 @@ backend = os.getenv("SIRCHMUNK_SEARCH_BACKEND", "rga")
 | 请求范围 | `rga` 回退与文件名枚举 |
 | --- | --- |
 | 显式根目录 | 仅使用这些目录并保留 include/exclude/max_depth；不得扩展到配置根目录 |
-| 全局索引，配置了 `ANYTXT_FALLBACK_ROOTS` | 仅使用配置根目录并保留过滤规则，标记 `scope_reduced=true`，明确结果仅覆盖这些目录 |
-| 全局索引，未配置回退根目录 | 不执行枚举或回退；按原因返回 backend_unavailable、unsupported_query 或 incomplete_results |
+| 全局检索（未显式范围），已配置 `ANYTXT_FALLBACK_ROOTS` | 仅使用配置根目录并保留过滤规则，标记 `scope_reduced=true`，明确结果仅覆盖这些目录 |
+| 全局检索（未显式范围），未配置回退根目录 | 不执行枚举或回退；按原因返回 backend_unavailable、unsupported_query 或 incomplete_results |
 
-`ANYTXT_FALLBACK_ROOTS` 是绝对目录组成的 JSON 数组，默认 `[]`；无效路径或配置应报配置错误，不替换为当前目录或所有磁盘。全局模式使用文件名枚举但没有根目录时，报告 `scope_required`；可选的 FAST 文件名步骤跳过并记录原因。所有内容检索回退均受 `ANYTXT_FALLBACK_TO_RGA` 开关控制，文件名枚举不受该开关控制。
+`ANYTXT_FALLBACK_ROOTS` 是绝对目录组成的 JSON 数组，默认 `[]`；无效路径或配置应报配置错误，不替换为当前目录或所有磁盘。`ANYTXT_GLOBAL_ROOTS` 同为绝对目录 JSON 数组、默认 `[]`，用于定义“未显式指定范围”时的查询范围；它只决定检索范围，不改变回退目录，也不改变 `ANYTXT_FALLBACK_TO_RGA` 的作用范围。全局模式使用文件名枚举但没有根目录时，报告 `scope_required`；可选的 FAST 文件名步骤跳过并记录原因。所有内容检索回退均受 `ANYTXT_FALLBACK_TO_RGA` 开关控制，文件名枚举不受该开关控制。
 
 在入口区分“未提供范围”和“显式范围”，将同一个内部 scope 传至 FAST、DEEP、ReAct、文件读取和知识复用；禁止中途用工作目录补全全局范围。显式范围还应在读取前校验解析后的真实路径，覆盖 Windows 大小写、分隔符和目录联接。
 
@@ -274,7 +274,9 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 ### 单元验证
 
 - 正常搜索响应转换为完整的事件组。
-- 空 `filterDir` 的全局搜索和显式目录搜索分别按预期工作。
+- 显式目录搜索、按 `ANYTXT_GLOBAL_ROOTS` 逐根查询合并、以及未配置全局根时的降级分别按预期工作。
+- 请求必须使用 JSON-RPC 2.0 信封并同时带 `Accept` 与 `Content-Type`；改动信封结构或删减任一头部视为契约回归。
+- 未配置 `ANYTXT_GLOBAL_ROOTS` 时结果标记 `unverified_global_scope`、`complete=false`；该状态下 AND/NOT 不得返回精确结果。
 - 模拟不同版本对空字符串和 `"*"` 的处理，验证兼容选择不会污染实际搜索结果。
 - 多目录结果按绝对路径去重。
 - `include`、`exclude` 和 `max_depth` 正确过滤。
@@ -296,6 +298,7 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 - 查询后检查知识簇已经写入并能再次读取。
 - 停止 AnyTXT 服务后验证 `rga` 回退。
 - 设置 `SIRCHMUNK_SEARCH_BACKEND=rga`，验证原行为未发生回归。
+- 配置 `ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]`，核对同一次查询能返回多个卷内的候选文件；并确认未配置该变量时结果被标记为不完整而不是全局结果。
 - 执行 5.1 的完整调用矩阵，特别验证无路径 DEEP/ReAct 不会在调用适配器前退出。
 
 ### 性能与召回基准

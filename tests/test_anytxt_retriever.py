@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -55,7 +56,7 @@ class FakeFallback:
 def config(**kwargs):
     values = dict(page_size=2, request_timeout=1, total_timeout=10, max_concurrency=2,
                   max_requests=30, max_candidates=30, max_fragment_chars=1000,
-                  fallback_to_rga=True, fallback_roots=())
+                  fallback_to_rga=True, fallback_roots=(), global_roots=())
     values.update(kwargs)
     return mod.AnyTXTConfig(**values)
 
@@ -103,8 +104,11 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1]["data"]["path"]["text"], r"D:\docs\a.pdf")
         self.assertEqual(events[1]["data"]["lines"]["text"], "fragment:alpha")
         self.assertEqual(client.search_calls[0][1], "")
-        self.assertEqual(events.metadata["effective_scope"], "global_index")
-        self.assertTrue(events.metadata["complete"])
+        # An empty filterDir is resolved by AnyTXT to its own directory, so the
+        # result must not be advertised as a complete global index search.
+        self.assertEqual(events.metadata["effective_scope"], mod.SERVER_DEFAULT_SCOPE)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn(mod.UNVERIFIED_GLOBAL_REASON, events.metadata["reason"])
         merged = retriever.merge_results(events)
         self.assertEqual(merged[0]["_retrieval_metadata"]["actual_backend"], "anytxt")
 
@@ -144,16 +148,21 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len([event for event in events if event["type"] == "begin"]), 1)
 
     async def test_and_and_not_are_file_set_operations(self):
+        root = r"D:\lib"
         pages = {
-            ("alpha", "", 0): ([{"fid": "1", "file": r"D:\\a.pdf"}, {"fid": "2", "file": r"D:\\b.pdf"}], 2),
-            ("beta", "", 0): ([{"fid": "2", "file": r"D:\\b.pdf"}], 1),
+            ("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}, {"fid": "2", "file": r"D:\lib\b.pdf"}], 2),
+            ("beta", root, 0): ([{"fid": "2", "file": r"D:\lib\b.pdf"}], 1),
         }
-        and_retriever = mod.AnyTXTRetriever(config=config(page_size=3), client=FakeClient(pages))
+        and_retriever = mod.AnyTXTRetriever(config=config(page_size=3, global_roots=(root,)), client=FakeClient(pages))
         and_events = await and_retriever.retrieve(["alpha", "beta"], path=None, logic="and", literal=True, regex=False)
-        self.assertEqual([e["data"]["path"]["text"] for e in and_events if e["type"] == "begin"], [r"D:\b.pdf"])
-        not_retriever = mod.AnyTXTRetriever(config=config(page_size=3), client=FakeClient(pages))
+        self.assertEqual(
+            [e["data"]["path"]["text"] for e in and_events if e["type"] == "begin"], [r"D:\lib\b.pdf"]
+        )
+        not_retriever = mod.AnyTXTRetriever(config=config(page_size=3, global_roots=(root,)), client=FakeClient(pages))
         not_events = await not_retriever.retrieve(["alpha", "beta"], path=None, logic="not", literal=True, regex=False)
-        self.assertEqual([e["data"]["path"]["text"] for e in not_events if e["type"] == "begin"], [r"D:\a.pdf"])
+        self.assertEqual(
+            [e["data"]["path"]["text"] for e in not_events if e["type"] == "begin"], [r"D:\lib\a.pdf"]
+        )
 
     async def test_repeated_page_makes_or_incomplete_and_exact_and_falls_back(self):
         repeated = [{"fid": "1", "file": r"D:\\docs\\a.pdf"}, {"fid": "2", "file": r"D:\\docs\\b.pdf"}]
@@ -210,6 +219,109 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await retriever.retrieve("alpha", path=r"D:\\docs", literal=True, regex=False)
         self.assertEqual(fallback.calls, [])
+
+    async def test_configured_global_roots_are_queried_per_root(self):
+        roots = [r"D:\lib", r"E:\lib"]
+        pages = {
+            ("alpha", roots[0], 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}], 1),
+            ("alpha", roots[1], 0): ([
+                {"fid": "1", "file": r"d:\LIB\A.pdf"},
+                {"fid": "2", "file": r"E:\lib\b.pdf"},
+            ], 2),
+        }
+        client = FakeClient(pages)
+        retriever = mod.AnyTXTRetriever(config=config(page_size=3, global_roots=tuple(roots)), client=client)
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual([call[1] for call in client.search_calls], roots)
+        self.assertEqual(
+            [event["data"]["path"]["text"] for event in events if event["type"] == "begin"],
+            [r"D:\lib\a.pdf", r"E:\lib\b.pdf"],
+        )
+        self.assertEqual(events.metadata["effective_scope"], roots)
+        self.assertTrue(events.metadata["complete"])
+
+    async def test_unverified_global_scope_never_claims_exact_set_operations(self):
+        pages = {("alpha", "", 0): ([{"fid": "1", "file": r"C:\a.pdf"}], 1)}
+        fallback = FakeFallback()
+        retriever = mod.AnyTXTRetriever(
+            config=config(fallback_roots=(r"D:\lib",)), client=FakeClient(pages), fallback=fallback
+        )
+        result = await retriever.retrieve(["alpha", "beta"], path=None, logic="and", literal=True, regex=False)
+        self.assertEqual(result.metadata["fallback_reason"], "AnyTXTIncompleteResults")
+        self.assertEqual(len(fallback.calls), 1)
+        self.assertEqual(fallback.calls[0]["path"], [r"D:\lib"])
+
+    def test_global_roots_are_read_from_env_and_validated(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            encoded = json.dumps([first, second])
+            with patch.dict(os.environ, {"ANYTXT_GLOBAL_ROOTS": encoded}, clear=True):
+                parsed = mod.AnyTXTConfig.from_env()
+            self.assertEqual(parsed.global_roots, (mod._absolute_path(first), mod._absolute_path(second)))
+            self.assertEqual(parsed.fallback_roots, ())
+        with patch.dict(os.environ, {"ANYTXT_GLOBAL_ROOTS": '["relative"]'}, clear=True):
+            with self.assertRaisesRegex(ValueError, "non-absolute"):
+                mod.AnyTXTConfig.from_env()
+        with patch.dict(os.environ, {"ANYTXT_GLOBAL_ROOTS": "{}"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "must be a JSON array"):
+                mod.AnyTXTConfig.from_env()
+
+
+class RpcContractTests(unittest.IsolatedAsyncioTestCase):
+    """The local service rejects requests which miss either required header."""
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return self._body
+
+    def _capture(self, body: bytes):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return self._Response(body)
+
+        return captured, fake_urlopen
+
+    async def test_search_sends_jsonrpc_envelope_and_required_headers(self):
+        body = b'{"result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+        captured, fake_urlopen = self._capture(body)
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
+
+        request = captured["request"]
+        headers = {key.lower(): value for key, value in request.headers.items()}
+        self.assertEqual(headers.get("accept"), "application/json")
+        self.assertEqual(headers.get("content-type"), "application/json")
+
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["jsonrpc"], "2.0")
+        self.assertIn("id", payload)
+        self.assertEqual(payload["method"], mod.AnyTXTClient.SEARCH_METHOD)
+        self.assertEqual(payload["params"]["input"]["pattern"], "alpha")
+        self.assertEqual(payload["params"]["input"]["filterDir"], "")
+
+    async def test_fragment_uses_jsonrpc_envelope(self):
+        body = b'{"result": {"data": {"output": {"text": "snippet"}}}}'
+        captured, fake_urlopen = self._capture(body)
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            text = await client.get_fragment("fid-1", "alpha", mod._Budget(config(), 5))
+
+        self.assertEqual(text, "snippet")
+        payload = json.loads(captured["request"].data.decode("utf-8"))
+        self.assertEqual(payload["method"], mod.AnyTXTClient.FRAGMENT_METHOD)
+        self.assertEqual(payload["params"]["input"], {"fid": "fid-1", "pattern": "alpha"})
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ flowchart LR
 
 第一阶段会实现一个 AnyTXT 检索适配器，并尽量保持 Sirchmunk 的下游流程不变：
 
-1. 调用 AnyTXT 本机 JSON-RPC 服务在全局索引中搜索关键词；用户明确限定范围时再过滤目录。
+1. 调用 AnyTXT 本机 JSON-RPC 服务检索关键词：未指定范围时按 `ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，用户明确限定范围时只查询这些目录。
 2. 将文件路径和命中片段转换为 Sirchmunk 当前检索器使用的数据结构。
 3. 让 Sirchmunk 的 FAST 和 DEEP 查询通过配置选择 AnyTXT。
 4. 继续使用 Sirchmunk 的原始文件读取、证据追踪和知识保存能力。
@@ -43,13 +43,16 @@ flowchart LR
 SIRCHMUNK_SEARCH_BACKEND=anytxt
 ANYTXT_API_URL=http://127.0.0.1:9920
 ANYTXT_SEARCH_LIMIT=300
+ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
 ANYTXT_FALLBACK_TO_RGA=true
 ANYTXT_FALLBACK_ROOTS=[]
 ```
 
 默认配置仍将保持 Sirchmunk 原有行为。只有显式选择 `anytxt` 后才使用 AnyTXT 索引。
 
-`ANYTXT_SEARCH_LIMIT` 是页大小。全局搜索失败后，仅在 `ANYTXT_FALLBACK_ROOTS` 配置了绝对目录 JSON 数组时才回退，并明确结果范围已缩小；不会自动扫描当前目录或整盘。文件名搜索也需要明确目录。完整预算配置见需求文档 FR-8。
+`ANYTXT_SEARCH_LIMIT` 是页大小。`ANYTXT_GLOBAL_ROOTS` 定义“用户没有指定目录”时的检索范围：AnyTXT 的 RPC 没有枚举已索引卷的方法，而且把空 `filterDir` 解析成它自己的当前目录（实测只返回 C 盘），所以不配置它时只查询那个默认目录，结果会被标记为不完整（`unverified_global_scope`）并输出告警，而不会冒充全局结果。本机索引覆盖多个卷时，应按上面示例逐卷列出。
+
+全局搜索失败后，仅在 `ANYTXT_FALLBACK_ROOTS` 配置了绝对目录 JSON 数组时才回退，并明确结果范围已缩小；不会自动扫描当前目录或整盘。文件名搜索也需要明确目录。完整预算配置见需求文档 FR-8。
 
 结果达到预算上限时标记不完整，不对截断集合执行精确 AND/NOT 或计数。正则、字面量转义和大小写行为必须经过验证，未知能力按范围回退或报不支持。
 
@@ -88,10 +91,12 @@ git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
 ANYTXT_API_URL=http://127.0.0.1:9920
+ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
 ```
 
-不设置 `SIRCHMUNK_SEARCH_BACKEND` 时仍使用上游 `rga`。全局搜索发生故障时，
-只有配置了真实存在的绝对目录数组才允许缩小范围回退：
+不设置 `SIRCHMUNK_SEARCH_BACKEND` 时仍使用上游 `rga`。没有配置 `ANYTXT_GLOBAL_ROOTS` 时，
+不指定目录的查询只会命中 AnyTXT 服务端自己的默认目录，且结果会被标记为不完整。
+全局检索发生故障时，只有配置了真实存在的绝对目录数组才允许缩小范围回退：
 
 ```dotenv
 ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]

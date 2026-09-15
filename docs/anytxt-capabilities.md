@@ -245,6 +245,20 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 本轮据此把 `errno`、精确总数、`order=3`、`status` 与片段标记处理接进适配器；
 `getFragmentAll`、`getText`、`ocr`、`syncIndex` 与 MCP 端点仍列为"明确不做"（理由见技术方案）。
 
+### 4.7 v1-only 适配后的验收（2026-09-15）
+
+在完整 Sirchmunk 环境（锁定 commit `3c7ee54` + 最新补丁 + `D:\OneDrive\SirchmunkData`）中，
+以 `SIRCHMUNK_SEARCH_PATHS=""`（即走 `ANYTXT_GLOBAL_ROOTS` 逐卷查询）重跑：
+
+| 场景 | 结果 |
+| --- | --- |
+| FAST（`partimento`） | 55 秒出答案；来源为 `C:\...\Zotero\` 与 `D:\AiPrograms\Cherryagent\` 的真实文献（均不在任何显式路径内，只可能来自逐卷全局检索）；0 次失败、0 次超时 |
+| DEEP（`partimento 的历史起源与教学形式`） | 190 秒完成 6 轮 ReAct（`phases=7/10`，Phase 1 关键词 8 个、Phase 2 `keyword_files=1399`）；答案为那不勒斯音乐学院及其教学形式；**0 次连接失败、0 次超时、0 次重试**；知识簇写回 parquet |
+
+两次运行期间 `ATGUI.exe` 的 PID 全程为 42368，未变化；查询结束后 `anytxt.v1.status` 仍返回
+`return = true`。相比上一轮"19～32 次偶发超时全部靠重试吸收"的记录，本轮没有再出现超时——
+精确计数让分页在收满即停，减少了单位时间内的请求量。该结论只覆盖单机、单次运行。
+
 ## 5. 全局搜索参数差异
 
 在本机 1.3.2477 中，对同一个已知可命中的查询进行只读对照：

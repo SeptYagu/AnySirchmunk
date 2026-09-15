@@ -137,9 +137,9 @@ sirchmunk search "partimento" --mode FAST --work-path 'D:\OneDrive\SirchmunkData
 
 ## 5. 环境状态
 
-- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，但仍是第四轮之前的旧补丁；
-  当前补丁的反向预检会失败，必须先按旧交付状态安全回滚或重建干净 worktree，再应用本轮补丁。
-  不要用当前 `rollback.ps1` 强行处理旧补丁，也不要覆盖其中已有的用户改动。
+- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，已从可精确识别的历史补丁
+  `daefa4c` 无冲突回滚，并部署 AnySirchmunk `35c72ea` 的当前补丁；62 个契约测试、
+  四个集成文件编译和当前补丁反向预检均通过。部署前目标除旧补丁本身外没有其他改动或未跟踪文件。
 - `D:\OneDrive\SirchmunkData`：工作目录；知识 parquet 已随 DEEP 验收更新（26 353 字节，13:15）。
 - AnyTXT 1.3.3541，`ATGUI.exe` 当前 PID 42368，同时监听 `9920` 与 `9924`（只有 9924 被使用）。
 - 临时探测脚本留在 `.workbuddy/tmp/`（gitignored），可作为契约证据重放。

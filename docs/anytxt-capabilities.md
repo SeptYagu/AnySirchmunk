@@ -171,6 +171,17 @@ ATRpcServer.Searcher.V1.GetFragment
 - v1 另有 `anytxt.v1.search`（精确 `count`）、原生 `&`/`|`/`!`/`"短语"` 语法、`status`、
   `getFragmentAll`、`getText`、`ocr`，可作为后续增强（见 `Anytxt APIv1.txt`）。
 
+加上 15 秒超时与"超时重试一次"之后复测：
+
+| 场景 | 结果 |
+| --- | --- |
+| DEEP（484 秒、6 轮 ReAct） | ATGUI PID 全程不变；**19 次偶发超时全部被重试吸收**（没有一次变成未恢复失败）；Phase 2 得到 421 个候选；知识簇复用命中 |
+| FAST（116 秒） | PID 不变；2 次超时被吸收；答案含真实来源（`Sanguinetti - 2012 - The art of partimento`） |
+
+偶发停顿仍会出现（正常响应是毫秒级，负载下个别请求会停顿数秒），但重试让它不再影响结果；
+代价是长查询耗时增加（DEEP 约 4.5 分钟 → 约 8 分钟）。若要缩短，可把 `ANYTXT_SEARCH_LIMIT` 调小
+（响应体积更小）或把 `ANYTXT_MAX_CONCURRENCY` 降到 1，两者都会减少单位时间的服务端压力。
+
 ## 5. 全局搜索参数差异
 
 在本机 1.3.2477 中，对同一个已知可命中的查询进行只读对照：

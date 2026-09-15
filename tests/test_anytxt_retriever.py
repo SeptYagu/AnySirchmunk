@@ -75,6 +75,11 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive"):
                 mod.AnyTXTConfig.from_env()
 
+    def test_default_concurrency_is_the_verified_safe_value(self):
+        # AnyTXT 1.3.2477 segfaults on overlapping requests carrying CJK
+        # patterns; concurrency 2 is the highest value verified safe.
+        self.assertEqual(mod.AnyTXTConfig().max_concurrency, 2)
+
     def test_accepts_existing_absolute_fallback_root(self):
         with tempfile.TemporaryDirectory() as directory:
             encoded = __import__("json").dumps([directory])

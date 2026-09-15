@@ -85,7 +85,11 @@ class AnyTXTConfig:
     page_size: int = 300
     request_timeout: float = 5.0
     total_timeout: float = 30.0
-    max_concurrency: int = 4
+    #: Verified safe against AnyTXT 1.3.2477: its RPC service segfaults when
+    #: several requests overlap with non-ASCII patterns, which kills the whole
+    #: service for the rest of the run.  Concurrency 2 passed 90 consecutive
+    #: requests including CJK patterns; higher values stay unverified.
+    max_concurrency: int = 2
     max_requests: int = 100
     max_candidates: int = 3000
     max_fragment_chars: int = 100000
@@ -140,7 +144,7 @@ class AnyTXTConfig:
             page_size=positive("ANYTXT_SEARCH_LIMIT", "300", int),
             request_timeout=positive("ANYTXT_REQUEST_TIMEOUT", "5", float),
             total_timeout=positive("ANYTXT_TOTAL_TIMEOUT", "30", float),
-            max_concurrency=positive("ANYTXT_MAX_CONCURRENCY", "4", int),
+            max_concurrency=positive("ANYTXT_MAX_CONCURRENCY", "2", int),
             max_requests=positive("ANYTXT_MAX_REQUESTS", "100", int),
             max_candidates=positive("ANYTXT_MAX_CANDIDATES", "3000", int),
             max_fragment_chars=positive("ANYTXT_MAX_FRAGMENT_CHARS", "100000", int),

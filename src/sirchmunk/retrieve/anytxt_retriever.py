@@ -38,6 +38,25 @@ PathLike = Union[str, Path]
 #: HTTP 400 with an empty body, so they are part of the compatibility contract.
 RPC_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
 
+#: AnyTXT exposes two RPC surfaces from the same process.  ``v1`` is the
+#: documented endpoint and stayed healthy through the load that killed the
+#: legacy one, so it is the default; ``legacy`` remains for older builds that do
+#: not ship the v1 endpoint.
+API_MODES: Dict[str, Dict[str, Any]] = {
+    "v1": {
+        "default_url": "http://127.0.0.1:9924/rpc",
+        "search": "anytxt.v1.getResult",
+        "fragment": "anytxt.v1.getFragment",
+        "nested": False,
+    },
+    "legacy": {
+        "default_url": "http://127.0.0.1:9920",
+        "search": "ATRpcServer.Searcher.V1.GetResult",
+        "fragment": "ATRpcServer.Searcher.V1.GetFragment",
+        "nested": True,
+    },
+}
+
 #: ``filterDir=""`` is *not* a global search.  AnyTXT resolves the empty value to
 #: its own current directory (observed: ``C:``) and returns that drive only.
 SERVER_DEFAULT_SCOPE = "anytxt_server_default"
@@ -82,7 +101,9 @@ class RetrievalEvents(list):
 
 @dataclass(frozen=True)
 class AnyTXTConfig:
-    api_url: str = "http://127.0.0.1:9920"
+    #: ``v1`` (documented endpoint, default) or ``legacy`` (builds without it).
+    api_mode: str = "v1"
+    api_url: str = API_MODES["v1"]["default_url"]
     page_size: int = 300
     request_timeout: float = 5.0
     total_timeout: float = 30.0
@@ -133,7 +154,10 @@ class AnyTXTConfig:
             roots.append(root)
         global_roots = _env_roots("ANYTXT_GLOBAL_ROOTS", os.getenv("ANYTXT_GLOBAL_ROOTS", "[]"))
 
-        api_url = os.getenv("ANYTXT_API_URL", cls.api_url)
+        api_mode = os.getenv("ANYTXT_API_MODE", cls.api_mode).strip().lower()
+        if api_mode not in API_MODES:
+            raise ValueError("ANYTXT_API_MODE must be 'v1' or 'legacy'")
+        api_url = os.getenv("ANYTXT_API_URL", API_MODES[api_mode]["default_url"])
         parsed = urlparse(api_url)
         if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise ValueError("ANYTXT_API_URL must be an HTTP loopback URL")
@@ -141,6 +165,7 @@ class AnyTXTConfig:
         if fallback not in {"true", "false", "1", "0", "yes", "no"}:
             raise ValueError("ANYTXT_FALLBACK_TO_RGA must be a boolean")
         return cls(
+            api_mode=api_mode,
             api_url=api_url,
             page_size=positive("ANYTXT_SEARCH_LIMIT", "300", int),
             request_timeout=positive("ANYTXT_REQUEST_TIMEOUT", "5", float),
@@ -224,11 +249,16 @@ class _KindGate:
 
 
 class AnyTXTClient:
-    SEARCH_METHOD = "ATRpcServer.Searcher.V1.GetResult"
-    FRAGMENT_METHOD = "ATRpcServer.Searcher.V1.GetFragment"
+    #: Legacy method names, kept for callers and docs that reference them.
+    SEARCH_METHOD = API_MODES["legacy"]["search"]
+    FRAGMENT_METHOD = API_MODES["legacy"]["fragment"]
 
     def __init__(self, config: AnyTXTConfig) -> None:
         self.config = config
+        spec = API_MODES[config.api_mode]
+        self.search_method: str = spec["search"]
+        self.fragment_method: str = spec["fragment"]
+        self._nested_params: bool = bool(spec["nested"])
         self._ids = itertools.count(1)
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
         self._kind_gate = _KindGate()
@@ -264,9 +294,9 @@ class AnyTXTClient:
             "jsonrpc": "2.0",
             "id": next(self._ids),
             "method": method,
-            "params": {"input": params},
+            "params": {"input": params} if self._nested_params else params,
         }
-        kind = "search" if method == self.SEARCH_METHOD else "fragment"
+        kind = "search" if method == self.search_method else "fragment"
         async with self._kind_gate.hold(kind):
             async with self._semaphore:
                 try:
@@ -278,7 +308,7 @@ class AnyTXTClient:
         self, pattern: str, filter_dir: str, filter_ext: str, offset: int, limit: int, budget: _Budget
     ) -> SearchPage:
         result = await self._rpc(
-            self.SEARCH_METHOD,
+            self.search_method,
             {
                 "pattern": pattern,
                 "filterDir": filter_dir,
@@ -301,7 +331,7 @@ class AnyTXTClient:
         return SearchPage(tuple(files), count)
 
     async def get_fragment(self, fid: Any, pattern: str, budget: _Budget) -> str:
-        result = await self._rpc(self.FRAGMENT_METHOD, {"fid": fid, "pattern": pattern}, budget)
+        result = await self._rpc(self.fragment_method, {"fid": fid, "pattern": pattern}, budget)
         output = _rpc_output(result)
         if not isinstance(output, dict):
             raise AnyTXTBackendError("AnyTXT fragment response is missing output")
@@ -313,7 +343,7 @@ class AnyTXTClient:
     async def health_check(self) -> Dict[str, Any]:
         budget = _Budget(self.config, self.config.request_timeout)
         page = await self.search("zzzzanysirchmunkhealthcheck", "", "", 0, 1, budget)
-        return {"healthy": True, "rpc_method": self.SEARCH_METHOD, "structured": isinstance(page.files, tuple)}
+        return {"healthy": True, "rpc_method": self.search_method, "structured": isinstance(page.files, tuple)}
 
 
 class AnyTXTRetriever(BaseRetriever):

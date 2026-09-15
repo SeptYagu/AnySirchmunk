@@ -54,7 +54,8 @@ class FakeFallback:
 
 
 def config(**kwargs):
-    values = dict(page_size=2, request_timeout=1, total_timeout=10, max_concurrency=2,
+    values = dict(api_mode="legacy", api_url="http://127.0.0.1:9920",
+                  page_size=2, request_timeout=1, total_timeout=10, max_concurrency=2,
                   max_requests=30, max_candidates=30, max_fragment_chars=1000,
                   fallback_to_rga=True, fallback_roots=(), global_roots=())
     values.update(kwargs)
@@ -443,6 +444,70 @@ class ConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
             )
         # The gate must not degrade same-kind calls into a serial stream.
         self.assertGreaterEqual(peak[0], 2)
+
+
+class ApiModeTests(unittest.IsolatedAsyncioTestCase):
+    """v1 is the default endpoint; legacy stays available for older builds."""
+
+    SEARCH_BODY = b'{"jsonrpc": "2.0", "result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return self._body
+
+    def _capture(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+            return self._Response(self.SEARCH_BODY)
+
+        return captured, fake_urlopen
+
+    def test_default_mode_targets_the_documented_endpoint(self):
+        parsed = mod.AnyTXTConfig()
+        self.assertEqual(parsed.api_mode, "v1")
+        self.assertEqual(parsed.api_url, "http://127.0.0.1:9924/rpc")
+        client = mod.AnyTXTClient(parsed)
+        self.assertEqual(client.search_method, "anytxt.v1.getResult")
+        self.assertEqual(client.fragment_method, "anytxt.v1.getFragment")
+
+    async def test_v1_places_parameters_directly_in_params(self):
+        captured, fake_urlopen = self._capture()
+        client = mod.AnyTXTClient(config(api_mode="v1", api_url="http://127.0.0.1:9924/rpc"))
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await client.search("alpha", "C:\\", "", 0, 5, mod._Budget(config(), 5))
+        request = captured["request"]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://127.0.0.1:9924/rpc")
+        self.assertEqual(payload["method"], "anytxt.v1.getResult")
+        self.assertNotIn("input", payload["params"])
+        self.assertEqual(payload["params"]["pattern"], "alpha")
+
+    async def test_legacy_keeps_the_input_envelope(self):
+        captured, fake_urlopen = self._capture()
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await client.search("alpha", "C:\\", "", 0, 5, mod._Budget(config(), 5))
+        request = captured["request"]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(request.full_url, "http://127.0.0.1:9920")
+        self.assertEqual(payload["method"], "ATRpcServer.Searcher.V1.GetResult")
+        self.assertEqual(payload["params"]["input"]["pattern"], "alpha")
+
+    def test_invalid_api_mode_is_rejected(self):
+        with patch.dict(os.environ, {"ANYTXT_API_MODE": "v2"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "ANYTXT_API_MODE"):
+                mod.AnyTXTConfig.from_env()
 
 
 if __name__ == "__main__":

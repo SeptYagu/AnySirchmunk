@@ -89,6 +89,9 @@ class AnyTXTConfig:
     max_requests: int = 100
     max_candidates: int = 3000
     max_fragment_chars: int = 100000
+    #: Fragment lookups get their own request budget so that snippet retrieval
+    #: cannot starve the paging budget that discovers candidate files.
+    max_fragment_requests: int = 100
     fallback_to_rga: bool = True
     fallback_roots: tuple[str, ...] = ()
     #: Roots used for "no explicit range" queries.  An empty value means the
@@ -141,6 +144,7 @@ class AnyTXTConfig:
             max_requests=positive("ANYTXT_MAX_REQUESTS", "100", int),
             max_candidates=positive("ANYTXT_MAX_CANDIDATES", "3000", int),
             max_fragment_chars=positive("ANYTXT_MAX_FRAGMENT_CHARS", "100000", int),
+            max_fragment_requests=positive("ANYTXT_MAX_FRAGMENT_REQUESTS", "100", int),
             fallback_to_rga=fallback in {"true", "1", "yes"},
             fallback_roots=tuple(roots),
             global_roots=tuple(global_roots),
@@ -154,10 +158,17 @@ class SearchPage:
 
 
 class _Budget:
-    def __init__(self, config: AnyTXTConfig, caller_timeout: Optional[float]) -> None:
+    def __init__(
+        self,
+        config: AnyTXTConfig,
+        caller_timeout: Optional[float],
+        *,
+        max_requests: Optional[int] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
         total = min(config.total_timeout, caller_timeout) if caller_timeout else config.total_timeout
-        self.deadline = time.monotonic() + total
-        self.max_requests = config.max_requests
+        self.deadline = deadline if deadline is not None else time.monotonic() + total
+        self.max_requests = max_requests if max_requests is not None else config.max_requests
         self.requests = 0
 
     @property
@@ -348,7 +359,13 @@ class AnyTXTRetriever(BaseRetriever):
         except asyncio.CancelledError:
             raise
         except AnyTXTBudgetExhausted:
-            raise
+            logger.warning("AnyTXT retrieve budget exhausted before a candidate was collected")
+            metadata = self._metadata(
+                False, True, "budget_exhausted",
+                roots or list(self.config.global_roots) or SERVER_DEFAULT_SCOPE,
+            )
+            self.last_metadata = metadata
+            return RetrievalEvents(metadata=metadata)
         except (AnyTXTBackendError, AnyTXTUnsupportedQuery, AnyTXTIncompleteResults) as exc:
             remaining = effective_timeout - (time.monotonic() - started)
             if remaining <= 0:
@@ -403,7 +420,14 @@ class AnyTXTRetriever(BaseRetriever):
                 offset = 0
                 seen_pages: set[tuple[Any, ...]] = set()
                 while True:
-                    page = await self.client.search(term, scope, _file_type_glob(file_type), offset, self.config.page_size, budget)
+                    try:
+                        page = await self.client.search(term, scope, _file_type_glob(file_type), offset, self.config.page_size, budget)
+                    except AnyTXTBudgetExhausted:
+                        # Exhausting the request budget degrades the result, it must
+                        # not throw away the candidates already collected.
+                        complete = False
+                        reasons.append("budget_exhausted")
+                        break
                     signature = tuple(record.get("fid") for record in page.files)
                     if signature and signature in seen_pages:
                         complete = False
@@ -430,9 +454,11 @@ class AnyTXTRetriever(BaseRetriever):
                     if received < self.config.page_size:
                         break
                     offset += received
-                if not complete and reasons and reasons[-1] in {"repeated_page", "candidate_budget"}:
+                if not complete and reasons and reasons[-1] in {"repeated_page", "candidate_budget", "budget_exhausted"}:
                     break
             per_term.append(found)
+            if "budget_exhausted" in reasons:
+                break
 
         if logic in {"and", "not"} and not complete:
             raise AnyTXTIncompleteResults(f"{logic.upper()} requires complete upstream sets")
@@ -440,15 +466,33 @@ class AnyTXTRetriever(BaseRetriever):
         events: List[Dict[str, Any]] = []
         fragment_chars = 0
         fragment_cache: Dict[tuple[Any, str], str] = {}
+        fragments_exhausted = False
+        # Snippets are an optional enhancement: Sirchmunk reads the source file
+        # itself.  Giving them a separate budget keeps candidate discovery from
+        # being starved by fragment lookups.
+        fragment_budget = _Budget(
+            self.config,
+            timeout,
+            max_requests=self.config.max_fragment_requests,
+            deadline=budget.deadline,
+        )
         for key, candidate in selected.items():
             snippets: List[str] = []
             matched_terms = candidate.pop("_terms", terms[:1])
             for term in matched_terms:
+                if fragments_exhausted:
+                    break
                 cache_key = (candidate["fid"], term)
                 try:
                     if cache_key not in fragment_cache:
-                        fragment_cache[cache_key] = await self.client.get_fragment(candidate["fid"], term, budget)
+                        fragment_cache[cache_key] = await self.client.get_fragment(candidate["fid"], term, fragment_budget)
                     text = fragment_cache[cache_key]
+                except AnyTXTBudgetExhausted:
+                    # Keep every candidate that was already discovered.
+                    complete = False
+                    reasons.append("fragment_request_budget")
+                    fragments_exhausted = True
+                    break
                 except AnyTXTBackendError:
                     complete = False
                     reasons.append("fragment_failure")

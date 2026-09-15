@@ -265,6 +265,55 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "must be a JSON array"):
                 mod.AnyTXTConfig.from_env()
 
+    async def test_search_budget_exhaustion_keeps_collected_candidates(self):
+        root = r"D:\lib"
+        pages = {
+            ("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\a.pdf"}, {"fid": "2", "file": r"D:\lib\b.pdf"}], 2),
+            ("alpha", root, 2): ([{"fid": "3", "file": r"D:\lib\c.pdf"}], 1),
+        }
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=2, max_requests=1, global_roots=(root,)), client=FakeClient(pages)
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("budget_exhausted", events.metadata["reason"])
+        self.assertEqual(
+            [event["data"]["path"]["text"] for event in events if event["type"] == "begin"],
+            [r"D:\lib\a.pdf", r"D:\lib\b.pdf"],
+        )
+
+    async def test_fragment_budget_exhaustion_keeps_every_candidate(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([
+            {"fid": "1", "file": r"D:\lib\a.pdf"},
+            {"fid": "2", "file": r"D:\lib\b.pdf"},
+        ], 2)}
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=3, max_fragment_requests=1, global_roots=(root,)),
+            client=FakeClient(pages),
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("fragment_request_budget", events.metadata["reason"])
+        self.assertEqual(
+            [event["data"]["path"]["text"] for event in events if event["type"] == "begin"],
+            [r"D:\lib\a.pdf", r"D:\lib\b.pdf"],
+        )
+        # The candidate without a snippet is still reported, just without text.
+        self.assertEqual(
+            [event["data"]["lines"]["text"] for event in events if event["type"] == "match"],
+            ["fragment:alpha", ""],
+        )
+
+    async def test_budget_exhaustion_before_first_request_returns_metadata(self):
+        retriever = mod.AnyTXTRetriever(
+            config=config(max_requests=0, global_roots=(r"D:\lib",)), client=FakeClient({})
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(list(events), [])
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("budget_exhausted", events.metadata["reason"])
+
 
 class RpcContractTests(unittest.IsolatedAsyncioTestCase):
     """The local service rejects requests which miss either required header."""

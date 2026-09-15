@@ -108,7 +108,7 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 | `ANYTXT_FALLBACK_TO_RGA` | `true` | 内容检索故障、不支持或不完整时是否允许有界回退 |
 | `ANYTXT_FALLBACK_ROOTS` | `[]` | 全局模式回退/文件名枚举的绝对目录 JSON 数组；不改变 AnyTXT 全局检索范围 |
 | `ANYTXT_TOTAL_TIMEOUT` | `30` | 每次 retrieve 总预算秒数；与调用方 timeout 取较小值 |
-| `ANYTXT_MAX_CONCURRENCY` | `2` | RPC 最大并发数；本机 1.3.2477 在并发 4 且请求含中文 pattern 时服务段错误退出，2 是已验证安全值 |
+| `ANYTXT_MAX_CONCURRENCY` | `2` | 同类 RPC 请求的最大并发数；`GetResult` 与 `GetFragment` 之间强制互斥，因为 1.3.2477 在两类请求重叠时会退出服务（实测见 anytxt-capabilities.md 4.4） |
 | `ANYTXT_MAX_REQUESTS` | `100` | 每次 retrieve 的总 RPC 请求数 |
 | `ANYTXT_MAX_CANDIDATES` | `3000` | 每次 retrieve 的去重候选文件上限 |
 | `ANYTXT_MAX_FRAGMENT_CHARS` | `100000` | 每次 retrieve 的片段总字符上限 |

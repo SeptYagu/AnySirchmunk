@@ -378,5 +378,72 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["params"]["input"], {"fid": "fid-1", "pattern": "alpha"})
 
 
+class ConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
+    """AnyTXT 1.3.2477 dies when GetResult and GetFragment overlap."""
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return self._body
+
+    SEARCH_BODY = b'{"result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+    FRAGMENT_BODY = b'{"result": {"data": {"output": {"text": "snippet"}}}}'
+
+    def _tracking_urlopen(self, overlaps, peak):
+        import threading
+        import time as _time
+        lock = threading.Lock()
+        inflight = {"search": 0, "fragment": 0}
+
+        def fake_urlopen(request, timeout=None):
+            payload = json.loads(request.data.decode("utf-8"))
+            kind = "search" if payload["method"].endswith("GetResult") else "fragment"
+            with lock:
+                inflight[kind] += 1
+                if inflight["search"] and inflight["fragment"]:
+                    overlaps.append(dict(inflight))
+                peak[0] = max(peak[0], inflight[kind])
+            _time.sleep(0.02)
+            with lock:
+                inflight[kind] -= 1
+            return self._Response(self.SEARCH_BODY if kind == "search" else self.FRAGMENT_BODY)
+
+        return fake_urlopen
+
+    async def test_search_and_fragment_requests_never_overlap(self):
+        overlaps = []
+        peak = [0]
+        # Concurrency must be large enough that both kinds are admitted at the
+        # same time; with a smaller limit the semaphore alone would batch them
+        # into "all searches, then all fragments" and the test would pass even
+        # without the gate.
+        client = mod.AnyTXTClient(config(max_concurrency=8))
+        with patch.object(mod, "urlopen", self._tracking_urlopen(overlaps, peak)):
+            await asyncio.gather(
+                *[client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5)) for _ in range(4)],
+                *[client.get_fragment("fid", "alpha", mod._Budget(config(), 5)) for _ in range(4)],
+            )
+        self.assertEqual(overlaps, [], f"GetResult and GetFragment were in flight together: {overlaps}")
+
+    async def test_same_kind_requests_still_run_in_parallel(self):
+        overlaps = []
+        peak = [0]
+        client = mod.AnyTXTClient(config(max_concurrency=4))
+        with patch.object(mod, "urlopen", self._tracking_urlopen(overlaps, peak)):
+            await asyncio.gather(
+                *[client.get_fragment(f"fid-{index}", "alpha", mod._Budget(config(), 5)) for index in range(4)]
+            )
+        # The gate must not degrade same-kind calls into a serial stream.
+        self.assertGreaterEqual(peak[0], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ import ntpath
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Protocol, Sequence, Union
@@ -185,6 +186,43 @@ class _Budget:
         self.requests += 1
 
 
+class _KindGate:
+    """Keep different RPC methods from being in flight at the same time.
+
+    AnyTXT 1.3.2477 cannot serve ``GetResult`` and ``GetFragment`` concurrently:
+    overlapping calls of the two methods killed the service within a few dozen
+    requests, while either method alone stayed healthy at the same concurrency
+    (measured with ``scripts/anytxt_stability_probe.py``).  This gate lets calls
+    of one kind run in parallel while excluding calls of the other kind.
+    """
+
+    def __init__(self) -> None:
+        self._kind: Optional[str] = None
+        self._active = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    @asynccontextmanager
+    async def hold(self, kind: str):
+        while True:
+            if self._active == 0:
+                self._kind = kind
+                self._active = 1
+                self._idle.clear()
+                break
+            if self._kind == kind:
+                self._active += 1
+                break
+            await self._idle.wait()
+        try:
+            yield
+        finally:
+            self._active -= 1
+            if self._active == 0:
+                self._kind = None
+                self._idle.set()
+
+
 class AnyTXTClient:
     SEARCH_METHOD = "ATRpcServer.Searcher.V1.GetResult"
     FRAGMENT_METHOD = "ATRpcServer.Searcher.V1.GetFragment"
@@ -193,6 +231,7 @@ class AnyTXTClient:
         self.config = config
         self._ids = itertools.count(1)
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
+        self._kind_gate = _KindGate()
 
     def _post(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         request = Request(
@@ -227,11 +266,13 @@ class AnyTXTClient:
             "method": method,
             "params": {"input": params},
         }
-        async with self._semaphore:
-            try:
-                return await asyncio.wait_for(asyncio.to_thread(self._post, payload, timeout), timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                raise AnyTXTBackendError("AnyTXT request timed out") from exc
+        kind = "search" if method == self.SEARCH_METHOD else "fragment"
+        async with self._kind_gate.hold(kind):
+            async with self._semaphore:
+                try:
+                    return await asyncio.wait_for(asyncio.to_thread(self._post, payload, timeout), timeout=timeout)
+                except asyncio.TimeoutError as exc:
+                    raise AnyTXTBackendError("AnyTXT request timed out") from exc
 
     async def search(
         self, pattern: str, filter_dir: str, filter_ext: str, offset: int, limit: int, budget: _Budget

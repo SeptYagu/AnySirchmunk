@@ -105,7 +105,7 @@ class AnyTXTConfig:
     api_mode: str = "v1"
     api_url: str = API_MODES["v1"]["default_url"]
     page_size: int = 300
-    request_timeout: float = 5.0
+    request_timeout: float = 15.0
     total_timeout: float = 30.0
     #: Verified safe against AnyTXT 1.3.2477: its RPC service segfaults when
     #: several requests overlap with non-ASCII patterns, which kills the whole
@@ -168,7 +168,7 @@ class AnyTXTConfig:
             api_mode=api_mode,
             api_url=api_url,
             page_size=positive("ANYTXT_SEARCH_LIMIT", "300", int),
-            request_timeout=positive("ANYTXT_REQUEST_TIMEOUT", "5", float),
+            request_timeout=positive("ANYTXT_REQUEST_TIMEOUT", "15", float),
             total_timeout=positive("ANYTXT_TOTAL_TIMEOUT", "30", float),
             max_concurrency=positive("ANYTXT_MAX_CONCURRENCY", "2", int),
             max_requests=positive("ANYTXT_MAX_REQUESTS", "100", int),
@@ -286,23 +286,37 @@ class AnyTXTClient:
         return result
 
     async def _rpc(self, method: str, params: Dict[str, Any], budget: _Budget) -> Dict[str, Any]:
-        budget.charge()
-        timeout = min(self.config.request_timeout, budget.remaining)
-        if timeout <= 0:
-            raise AnyTXTBudgetExhausted("AnyTXT retrieve time budget exhausted")
-        payload = {
-            "jsonrpc": "2.0",
-            "id": next(self._ids),
-            "method": method,
-            "params": {"input": params} if self._nested_params else params,
-        }
         kind = "search" if method == self.search_method else "fragment"
-        async with self._kind_gate.hold(kind):
-            async with self._semaphore:
-                try:
-                    return await asyncio.wait_for(asyncio.to_thread(self._post, payload, timeout), timeout=timeout)
-                except asyncio.TimeoutError as exc:
-                    raise AnyTXTBackendError("AnyTXT request timed out") from exc
+        # AnyTXT answers in milliseconds but was observed to stall for seconds
+        # under sustained load.  A stalled response is retried once while the
+        # budget allows; connection failures are not retried because they
+        # normally mean the service itself is gone.
+        attempts = 2
+        for attempt in range(attempts):
+            budget.charge()
+            timeout = min(self.config.request_timeout, budget.remaining)
+            if timeout <= 0:
+                raise AnyTXTBudgetExhausted("AnyTXT retrieve time budget exhausted")
+            payload = {
+                "jsonrpc": "2.0",
+                "id": next(self._ids),
+                "method": method,
+                "params": {"input": params} if self._nested_params else params,
+            }
+            async with self._kind_gate.hold(kind):
+                async with self._semaphore:
+                    try:
+                        return await asyncio.wait_for(asyncio.to_thread(self._post, payload, timeout), timeout=timeout)
+                    except asyncio.TimeoutError as exc:
+                        can_retry = (
+                            attempt + 1 < attempts
+                            and budget.remaining > 0
+                            and budget.requests < budget.max_requests
+                        )
+                        if not can_retry:
+                            raise AnyTXTBackendError("AnyTXT request timed out") from exc
+                        logger.warning("AnyTXT request timed out; retrying once")
+        raise AnyTXTBackendError("AnyTXT request timed out")
 
     async def search(
         self, pattern: str, filter_dir: str, filter_ext: str, offset: int, limit: int, budget: _Budget

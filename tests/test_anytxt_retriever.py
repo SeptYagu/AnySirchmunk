@@ -510,5 +510,59 @@ class ApiModeTests(unittest.IsolatedAsyncioTestCase):
                 mod.AnyTXTConfig.from_env()
 
 
+class TimeoutRetryTests(unittest.IsolatedAsyncioTestCase):
+    """A single stalled response must not fail the whole query."""
+
+    SEARCH_BODY = b'{"jsonrpc": "2.0", "result": {"data": {"output": {"count": 0, "field": [], "files": []}}}}'
+
+    class _Response:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return self._body
+
+    def _client_and_budget(self):
+        settings = config(request_timeout=0.05, total_timeout=10)
+        return mod.AnyTXTClient(settings), mod._Budget(settings, 10)
+
+    async def test_timed_out_request_is_retried_once(self):
+        import time as _time
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                _time.sleep(0.4)  # far beyond the 0.05s request timeout
+            return self._Response(self.SEARCH_BODY)
+
+        client, budget = self._client_and_budget()
+        with patch.object(mod, "urlopen", fake_urlopen):
+            page = await client.search("alpha", "", "", 0, 5, budget)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(page.files, ())
+
+    async def test_persistently_stalling_request_fails_after_one_retry(self):
+        import time as _time
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            _time.sleep(0.4)
+            return self._Response(self.SEARCH_BODY)
+
+        client, budget = self._client_and_budget()
+        with patch.object(mod, "urlopen", fake_urlopen):
+            with self.assertRaises(mod.AnyTXTBackendError):
+                await client.search("alpha", "", "", 0, 5, budget)
+        self.assertEqual(calls["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

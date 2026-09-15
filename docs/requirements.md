@@ -102,9 +102,10 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `SIRCHMUNK_SEARCH_BACKEND` | `rga` | 选择检索后端 |
-| `ANYTXT_API_URL` | `http://127.0.0.1:9920` | AnyTXT 本地服务地址 |
+| `ANYTXT_API_MODE` | `v1` | 选择接口：`v1`（`anytxt.v1.*`，默认 `http://127.0.0.1:9924/rpc`）或 `legacy`（`ATRpcServer.Searcher.V1.*`，默认 `http://127.0.0.1:9920`） |
+| `ANYTXT_API_URL` | 按 `ANYTXT_API_MODE` | AnyTXT 本地服务地址 |
 | `ANYTXT_SEARCH_LIMIT` | `300` | RPC 页大小，不能代替总候选预算 |
-| `ANYTXT_REQUEST_TIMEOUT` | `5` | 单次 RPC 超时秒数，受剩余总预算限制 |
+| `ANYTXT_REQUEST_TIMEOUT` | `15` | 单次 RPC 超时秒数，受剩余总预算限制；超时后重试一次 |
 | `ANYTXT_FALLBACK_TO_RGA` | `true` | 内容检索故障、不支持或不完整时是否允许有界回退 |
 | `ANYTXT_FALLBACK_ROOTS` | `[]` | 全局模式回退/文件名枚举的绝对目录 JSON 数组；不改变 AnyTXT 全局检索范围 |
 | `ANYTXT_TOTAL_TIMEOUT` | `30` | 每次 retrieve 总预算秒数；与调用方 timeout 取较小值 |

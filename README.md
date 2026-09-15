@@ -1,4 +1,4 @@
-# AnySirchmunk
+# AnySirchmunk    （开发中，目前不保证可用）
 
 AnySirchmunk 计划把 [AnyTXT Searcher](https://anytxt.net/) 的本地全文索引接入 [Sirchmunk](https://github.com/modelscope/sirchmunk) 的检索链路。
 

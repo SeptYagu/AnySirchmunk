@@ -55,7 +55,7 @@ ENDPOINTS: Dict[str, Dict[str, Any]] = {
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--api", choices=tuple(ENDPOINTS), default="legacy",
+    parser.add_argument("--api", choices=tuple(ENDPOINTS), default="v1",
                         help="legacy endpoint on 9920, or the anytxt.v1 endpoint on 9924/rpc")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None, help="defaults to the endpoint's port")

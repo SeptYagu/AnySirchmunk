@@ -81,6 +81,12 @@ class ConfigTests(unittest.TestCase):
         # patterns; concurrency 2 is the highest value verified safe.
         self.assertEqual(mod.AnyTXTConfig().max_concurrency, 2)
 
+    def test_environment_defaults_pair_v1_with_its_documented_endpoint(self):
+        with patch.dict(os.environ, {}, clear=True):
+            parsed = mod.AnyTXTConfig.from_env()
+        self.assertEqual(parsed.api_mode, "v1")
+        self.assertEqual(parsed.api_url, "http://127.0.0.1:9924/rpc")
+
     def test_accepts_existing_absolute_fallback_root(self):
         with tempfile.TemporaryDirectory() as directory:
             encoded = __import__("json").dumps([directory])
@@ -102,6 +108,13 @@ class ResponseTests(unittest.TestCase):
 
 
 class RetrieverTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # Contract-test paths are synthetic Windows paths. Individual tests can
+        # override this when exercising stale index records.
+        self._isfile_patch = patch.object(mod.os.path, "isfile", return_value=True)
+        self._isfile_patch.start()
+        self.addCleanup(self._isfile_patch.stop)
+
     async def test_global_search_uses_empty_filter_and_emits_contract(self):
         client = FakeClient({("alpha", "", 0): ([{"fid": "1", "file": r"D:\\docs\\a.pdf", "size": 12}], 1)})
         retriever = mod.AnyTXTRetriever(config=config(), client=client)
@@ -311,6 +324,45 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
             ["fragment:alpha", ""],
         )
 
+    async def test_fragment_character_budget_stops_requests_and_marks_truncation(self):
+        root = r"D:\lib"
+        rows = [
+            {"fid": "1", "file": r"D:\lib\a.pdf"},
+            {"fid": "2", "file": r"D:\lib\b.pdf"},
+        ]
+        client = FakeClient({("alpha", root, 0): (rows, 2)}, fragments={("1", "alpha"): "abcdef"})
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=3, max_fragment_chars=3, global_roots=(root,)),
+            client=client,
+        )
+        events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("fragment_budget", events.metadata["reason"])
+        self.assertEqual(client.fragment_calls, [("1", "alpha")])
+        self.assertEqual(events.metadata["fragment_requests"], 1)
+        self.assertEqual(events.metadata["fragment_chars"], 3)
+        self.assertEqual(
+            [event["data"]["lines"]["text"] for event in events if event["type"] == "match"],
+            ["abc", ""],
+        )
+
+    async def test_invalid_candidate_is_skipped_and_marks_results_incomplete(self):
+        root = r"D:\lib"
+        rows = [
+            {"file": r"D:\lib\missing-fid.pdf"},
+            {"fid": "2", "file": r"D:\lib\missing-file.pdf"},
+        ]
+        client = FakeClient({("alpha", root, 0): (rows, 2)})
+        with patch.object(mod.os.path, "isfile", return_value=False):
+            retriever = mod.AnyTXTRetriever(
+                config=config(page_size=3, global_roots=(root,)), client=client
+            )
+            events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(list(events), [])
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("invalid_record", events.metadata["reason"])
+        self.assertEqual(client.fragment_calls, [])
+
     async def test_budget_exhaustion_before_first_request_returns_metadata(self):
         retriever = mod.AnyTXTRetriever(
             config=config(max_requests=0, global_roots=(r"D:\lib",)), client=FakeClient({})
@@ -434,6 +486,53 @@ class ConcurrencyGateTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(overlaps, [], f"GetResult and GetFragment were in flight together: {overlaps}")
 
+    async def test_different_clients_share_the_endpoint_gate(self):
+        overlaps = []
+        peak = [0]
+        first = mod.AnyTXTClient(config(max_concurrency=8))
+        second = mod.AnyTXTClient(config(max_concurrency=8))
+        with patch.object(mod, "urlopen", self._tracking_urlopen(overlaps, peak)):
+            await asyncio.gather(
+                first.search("alpha", "", "", 0, 5, mod._Budget(config(), 5)),
+                second.get_fragment("fid", "alpha", mod._Budget(config(), 5)),
+            )
+        self.assertEqual(overlaps, [], f"separate clients bypassed the endpoint gate: {overlaps}")
+
+    async def test_timed_out_worker_keeps_cross_kind_gate_until_transport_finishes(self):
+        import threading
+        import time as _time
+
+        overlaps = []
+        lock = threading.Lock()
+        inflight = {"search": 0, "fragment": 0}
+        search_calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            payload = json.loads(request.data.decode("utf-8"))
+            kind = "search" if payload["method"].endswith("GetResult") else "fragment"
+            with lock:
+                inflight[kind] += 1
+                if inflight["search"] and inflight["fragment"]:
+                    overlaps.append(dict(inflight))
+                if kind == "search":
+                    search_calls["n"] += 1
+                    call_number = search_calls["n"]
+                else:
+                    call_number = 0
+            _time.sleep(0.3 if kind == "search" and call_number == 1 else 0.005)
+            with lock:
+                inflight[kind] -= 1
+            return self._Response(self.SEARCH_BODY if kind == "search" else self.FRAGMENT_BODY)
+
+        fast_timeout = config(request_timeout=0.08, total_timeout=1, max_concurrency=2)
+        patient_timeout = config(request_timeout=0.8, total_timeout=1, max_concurrency=2)
+        first = mod.AnyTXTClient(fast_timeout)
+        second = mod.AnyTXTClient(patient_timeout)
+        with patch.object(mod, "urlopen", fake_urlopen):
+            await first.search("alpha", "", "", 0, 5, mod._Budget(fast_timeout, 1))
+            await second.get_fragment("fid", "alpha", mod._Budget(patient_timeout, 1))
+        self.assertEqual(overlaps, [], f"orphaned timeout worker bypassed the gate: {overlaps}")
+
     async def test_same_kind_requests_still_run_in_parallel(self):
         overlaps = []
         peak = [0]
@@ -548,6 +647,21 @@ class TimeoutRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls["n"], 2)
         self.assertEqual(page.files, ())
 
+    async def test_transport_timeout_is_retried_once(self):
+        calls = {"n": 0}
+
+        def fake_urlopen(request, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("socket timed out")
+            return self._Response(self.SEARCH_BODY)
+
+        client, budget = self._client_and_budget()
+        with patch.object(mod, "urlopen", fake_urlopen):
+            page = await client.search("alpha", "", "", 0, 5, budget)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(page.files, ())
+
     async def test_persistently_stalling_request_fails_after_one_retry(self):
         import time as _time
         calls = {"n": 0}
@@ -562,6 +676,18 @@ class TimeoutRetryTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(mod.AnyTXTBackendError):
                 await client.search("alpha", "", "", 0, 5, budget)
         self.assertEqual(calls["n"], 2)
+
+
+class DeliveryArtifactTests(unittest.TestCase):
+    def test_patch_templates_use_the_safe_v1_defaults(self):
+        patch_text = (MODULE_PATH.parents[3] / "patches" / "sirchmunk-3c7ee54-anytxt.patch").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(patch_text.count("+ANYTXT_API_MODE=v1"), 2)
+        self.assertEqual(patch_text.count("+ANYTXT_API_URL=http://127.0.0.1:9924/rpc"), 2)
+        self.assertEqual(patch_text.count("+ANYTXT_MAX_CONCURRENCY=2"), 2)
+        self.assertEqual(patch_text.count("+ANYTXT_MAX_FRAGMENT_REQUESTS=100"), 2)
+        self.assertNotIn("+ANYTXT_MAX_CONCURRENCY=4", patch_text)
 
 
 if __name__ == "__main__":

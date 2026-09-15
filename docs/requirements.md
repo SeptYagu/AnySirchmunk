@@ -27,7 +27,7 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 ### FR-1：AnyTXT 连接
 
 - 通过可配置 URL 连接 AnyTXT 本地 JSON-RPC 服务。
-- 默认地址为 `http://127.0.0.1:9920`。
+- 默认使用 v1 接口 `http://127.0.0.1:9924/rpc`；旧版 legacy 接口可显式配置为 `http://127.0.0.1:9920`。
 - 为每次请求设置超时。
 - 对连接失败、超时、非法响应和接口错误给出可诊断日志。
 - 不把本地 API 暴露到公网，也不要求 AnyTXT 账号或云服务。
@@ -37,8 +37,7 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 - 支持单个关键词和多个关键词。
 - 支持两类范围：显式根目录，以及由 `ANYTXT_GLOBAL_ROOTS` 声明的“未指定范围”检索范围。AnyTXT RPC 没有可枚举已索引卷的方法，空 `filterDir` 会被服务端解析为自己的当前目录，因此全局范围不能由空参数隐式表达，也不能通过扫描磁盘猜测。
 - 支持用户在需要时限定一个或多个搜索根目录。
-- 调用 `ATRpcServer.Searcher.V1.GetResult` 获取候选文件。
-- 调用 `ATRpcServer.Searcher.V1.GetFragment` 获取匹配片段。
+- v1 默认调用 `anytxt.v1.getResult` / `anytxt.v1.getFragment`；legacy 模式调用 `ATRpcServer.Searcher.V1.GetResult` / `ATRpcServer.Searcher.V1.GetFragment`。
 - 保留 AnyTXT 返回的稳定文件标识、绝对路径、修改时间和文件大小等可用元数据。
 - 去除重复文件，并限制请求数、文件数和片段总字符数。
 - 片段请求使用独立于候选发现的请求预算；任一预算耗尽只把结果标记为不完整并保留已发现的候选，不得丢弃候选或向调用方抛出预算异常。

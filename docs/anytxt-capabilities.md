@@ -140,11 +140,13 @@ ATRpcServer.Searcher.V1.GetFragment
 
 适配器的应对：
 
-- `_KindGate` 保证 `GetResult` 与 `GetFragment` 不会同时在飞：同一类请求仍可并发到 `ANYTXT_MAX_CONCURRENCY`（默认 2），跨类请求按到达顺序串行；
+- 进程级 `_EndpointGate` 按 API 端点在所有客户端实例之间共享：保证 `GetResult` 与
+  `GetFragment` 不会同时在飞，同一类请求仍可并发到 `ANYTXT_MAX_CONCURRENCY`（默认 2）；
+  闸门由实际执行 HTTP 的线程持有，因此协程超时或取消后，底层请求结束前不会错误放行另一类方法；
 - 崩溃窗口内的检索以 WARNING 明确记录，不会静默降级成零结果；
 - 长时间连续检索（DEEP / 多关键词）可为 `ATGUI.exe` 配置进程级自动重启作为兜底——那是兜底，不是稳定性保证。
 
-**追加验证（2026-09-15，`_KindGate` 落地之后）**：两类方法已经互斥，默认配置下的完整 DEEP 查询（6 轮 ReAct、多关键词）
+**追加验证（2026-09-15，方法类别闸门落地之后）**：两类方法已经互斥，默认配置下的完整 DEEP 查询（6 轮 ReAct、多关键词）
 仍然在开始后 **49 秒**让服务退出（37 次请求得到 `WinError 10061`、`ATGUI.exe` PID 变化、其后的 ReAct 检索全部失败）。
 这说明 1.3.2477 的可用请求预算本身极小（百次量级），单独消除"两类重叠"并不足以支撑长查询。
 

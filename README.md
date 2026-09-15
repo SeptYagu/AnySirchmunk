@@ -41,8 +41,16 @@ flowchart LR
 
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
-ANYTXT_API_URL=http://127.0.0.1:9920
+ANYTXT_API_MODE=v1
+ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 ANYTXT_SEARCH_LIMIT=300
+ANYTXT_REQUEST_TIMEOUT=15
+ANYTXT_TOTAL_TIMEOUT=30
+ANYTXT_MAX_CONCURRENCY=2
+ANYTXT_MAX_REQUESTS=100
+ANYTXT_MAX_CANDIDATES=3000
+ANYTXT_MAX_FRAGMENT_CHARS=100000
+ANYTXT_MAX_FRAGMENT_REQUESTS=100
 ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
 ANYTXT_FALLBACK_TO_RGA=true
 ANYTXT_FALLBACK_ROOTS=[]
@@ -69,8 +77,8 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 ## 前置条件
 
 - Windows
-- AnyTXT Searcher 已安装、正在运行并完成文献索引
-- AnyTXT 本地 API 可通过 `127.0.0.1:9920` 访问
+- AnyTXT Searcher 1.3.3541 或更高版本已安装、正在运行并完成文献索引
+- AnyTXT v1 本地 API 可通过 `http://127.0.0.1:9924/rpc` 访问
 - Sirchmunk 的 Python 环境可以正常运行
 - 已配置 Sirchmunk 使用的 LLM API
 
@@ -90,7 +98,8 @@ git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
 
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
-ANYTXT_API_URL=http://127.0.0.1:9920
+ANYTXT_API_MODE=v1
+ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
 ```
 
@@ -134,6 +143,11 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.5 节），长查询需要 **1.3.3541 及以上**，
 并使用默认的 v1 接口（`ANYTXT_API_MODE=v1`，即 `http://127.0.0.1:9924/rpc`）。
 旧版本可以设 `ANYTXT_API_MODE=legacy`（9920），但只适合短查询。需要复测时用同一个探针脚本：
+
+```dotenv
+ANYTXT_API_MODE=legacy
+ANYTXT_API_URL=http://127.0.0.1:9920
+```
 
 ```powershell
 python scripts/anytxt_stability_probe.py --api v1 --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300

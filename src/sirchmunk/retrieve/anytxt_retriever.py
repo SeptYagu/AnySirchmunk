@@ -15,8 +15,9 @@ import logging
 import ntpath
 import os
 import re
+import threading
 import time
-from contextlib import asynccontextmanager
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Protocol, Sequence, Union
@@ -69,6 +70,10 @@ class AnyTXTError(RuntimeError):
 
 class AnyTXTBackendError(AnyTXTError):
     """The local service could not complete a valid RPC request."""
+
+
+class AnyTXTRequestTimeout(AnyTXTBackendError):
+    """The local service did not answer before the per-request timeout."""
 
 
 class AnyTXTUnsupportedQuery(AnyTXTError):
@@ -211,41 +216,63 @@ class _Budget:
         self.requests += 1
 
 
-class _KindGate:
-    """Keep different RPC methods from being in flight at the same time.
+class _EndpointGate:
+    """Process-wide concurrency and method-kind gate for one RPC endpoint.
 
     AnyTXT 1.3.2477 cannot serve ``GetResult`` and ``GetFragment`` concurrently:
     overlapping calls of the two methods killed the service within a few dozen
-    requests, while either method alone stayed healthy at the same concurrency
-    (measured with ``scripts/anytxt_stability_probe.py``).  This gate lets calls
-    of one kind run in parallel while excluding calls of the other kind.
+    requests.  The gate is synchronous because it must remain held by the worker
+    thread even when the awaiting coroutine times out or is cancelled.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_concurrency: int) -> None:
+        self._condition = threading.Condition()
+        self._max_concurrency = max_concurrency
         self._kind: Optional[str] = None
         self._active = 0
-        self._idle = asyncio.Event()
-        self._idle.set()
 
-    @asynccontextmanager
-    async def hold(self, kind: str):
-        while True:
+    def tighten(self, max_concurrency: int) -> None:
+        """Use the safest limit requested by live clients for this endpoint."""
+        with self._condition:
+            self._max_concurrency = min(self._max_concurrency, max_concurrency)
+            self._condition.notify_all()
+
+    def acquire(self, kind: str, cancelled: Optional[threading.Event]) -> None:
+        with self._condition:
+            while self._active and (
+                self._kind != kind or self._active >= self._max_concurrency
+            ):
+                if cancelled is not None and cancelled.is_set():
+                    raise AnyTXTRequestTimeout("AnyTXT request was cancelled before dispatch")
+                self._condition.wait(timeout=0.05)
+            if cancelled is not None and cancelled.is_set():
+                raise AnyTXTRequestTimeout("AnyTXT request was cancelled before dispatch")
             if self._active == 0:
                 self._kind = kind
-                self._active = 1
-                self._idle.clear()
-                break
-            if self._kind == kind:
-                self._active += 1
-                break
-            await self._idle.wait()
-        try:
-            yield
-        finally:
+            self._active += 1
+
+    def release(self) -> None:
+        with self._condition:
             self._active -= 1
             if self._active == 0:
                 self._kind = None
-                self._idle.set()
+            self._condition.notify_all()
+
+
+_ENDPOINT_GATES: "weakref.WeakValueDictionary[str, _EndpointGate]" = weakref.WeakValueDictionary()
+_ENDPOINT_GATES_LOCK = threading.Lock()
+
+
+def _endpoint_gate(url: str, max_concurrency: int) -> _EndpointGate:
+    key = url.rstrip("/").lower()
+    with _ENDPOINT_GATES_LOCK:
+        gate = _ENDPOINT_GATES.get(key)
+        if gate is None:
+            gate = _EndpointGate(max_concurrency)
+            _ENDPOINT_GATES[key] = gate
+        else:
+            gate.tighten(max_concurrency)
+        return gate
 
 
 class AnyTXTClient:
@@ -260,21 +287,38 @@ class AnyTXTClient:
         self.fragment_method: str = spec["fragment"]
         self._nested_params: bool = bool(spec["nested"])
         self._ids = itertools.count(1)
-        self._semaphore = asyncio.Semaphore(config.max_concurrency)
-        self._kind_gate = _KindGate()
+        self._endpoint_gate = _endpoint_gate(config.api_url, config.max_concurrency)
 
-    def _post(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    def _post(
+        self,
+        payload: Dict[str, Any],
+        timeout: float,
+        kind: str,
+        cancelled: threading.Event,
+    ) -> Dict[str, Any]:
         request = Request(
             self.config.api_url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers=dict(RPC_HEADERS),
             method="POST",
         )
+        self._endpoint_gate.acquire(kind, cancelled)
         try:
-            with urlopen(request, timeout=timeout) as response:
-                raw = response.read()
-        except (HTTPError, URLError, OSError, TimeoutError) as exc:
-            raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    raw = response.read()
+            except TimeoutError as exc:
+                raise AnyTXTRequestTimeout(f"AnyTXT request timed out: {exc}") from exc
+            except HTTPError as exc:
+                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
+            except URLError as exc:
+                if isinstance(exc.reason, TimeoutError):
+                    raise AnyTXTRequestTimeout(f"AnyTXT request timed out: {exc}") from exc
+                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
+            except OSError as exc:
+                raise AnyTXTBackendError(f"AnyTXT request failed: {exc}") from exc
+        finally:
+            self._endpoint_gate.release()
         try:
             result = json.loads(raw.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -303,19 +347,25 @@ class AnyTXTClient:
                 "method": method,
                 "params": {"input": params} if self._nested_params else params,
             }
-            async with self._kind_gate.hold(kind):
-                async with self._semaphore:
-                    try:
-                        return await asyncio.wait_for(asyncio.to_thread(self._post, payload, timeout), timeout=timeout)
-                    except asyncio.TimeoutError as exc:
-                        can_retry = (
-                            attempt + 1 < attempts
-                            and budget.remaining > 0
-                            and budget.requests < budget.max_requests
-                        )
-                        if not can_retry:
-                            raise AnyTXTBackendError("AnyTXT request timed out") from exc
-                        logger.warning("AnyTXT request timed out; retrying once")
+            cancelled = threading.Event()
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._post, payload, timeout, kind, cancelled),
+                    timeout=timeout,
+                )
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            except (asyncio.TimeoutError, AnyTXTRequestTimeout) as exc:
+                cancelled.set()
+                can_retry = (
+                    attempt + 1 < attempts
+                    and budget.remaining > 0
+                    and budget.requests < budget.max_requests
+                )
+                if not can_retry:
+                    raise AnyTXTBackendError("AnyTXT request timed out") from exc
+                logger.warning("AnyTXT request timed out; retrying once")
         raise AnyTXTBackendError("AnyTXT request timed out")
 
     async def search(
@@ -526,7 +576,12 @@ class AnyTXTRetriever(BaseRetriever):
                     valid_received = 0
                     for record in page.files:
                         tagged_record = dict(record, _term=term)
-                        candidate = self._candidate(tagged_record, scope_roots, max_depth, include, exclude)
+                        try:
+                            candidate = self._candidate(tagged_record, scope_roots, max_depth, include, exclude)
+                        except ValueError:
+                            complete = False
+                            reasons.append("invalid_record")
+                            continue
                         if candidate is None:
                             continue
                         valid_received += 1
@@ -571,6 +626,12 @@ class AnyTXTRetriever(BaseRetriever):
             for term in matched_terms:
                 if fragments_exhausted:
                     break
+                remaining = self.config.max_fragment_chars - fragment_chars
+                if remaining <= 0:
+                    complete = False
+                    reasons.append("fragment_budget")
+                    fragments_exhausted = True
+                    break
                 cache_key = (candidate["fid"], term)
                 try:
                     if cache_key not in fragment_cache:
@@ -586,12 +647,11 @@ class AnyTXTRetriever(BaseRetriever):
                     complete = False
                     reasons.append("fragment_failure")
                     continue
-                remaining = self.config.max_fragment_chars - fragment_chars
-                if remaining <= 0:
+                if len(text) > remaining:
                     complete = False
                     reasons.append("fragment_budget")
-                    break
-                text = text[:remaining]
+                    fragments_exhausted = True
+                    text = text[:remaining]
                 fragment_chars += len(text)
                 if text:
                     snippets.append(text)
@@ -610,7 +670,13 @@ class AnyTXTRetriever(BaseRetriever):
                 })
             events.append({"type": "end", "data": common, "_search_backend": "anytxt"})
         metadata = self._metadata(complete, not complete, ",".join(dict.fromkeys(reasons)) or None, effective_scope)
-        metadata.update({"requests": budget.requests, "candidates": len(selected), "fragment_chars": fragment_chars})
+        metadata.update({
+            "requests": budget.requests + fragment_budget.requests,
+            "search_requests": budget.requests,
+            "fragment_requests": fragment_budget.requests,
+            "candidates": len(selected),
+            "fragment_chars": fragment_chars,
+        })
         for event in events:
             event["_retrieval_metadata"] = metadata
         return RetrievalEvents(events, metadata=metadata)
@@ -652,7 +718,12 @@ class AnyTXTRetriever(BaseRetriever):
             return None
         if exclude and any(_matches_glob(relative, pattern) for pattern in exclude):
             return None
-        result = {"path": absolute, "fid": record.get("fid"), "lastModify": record.get("lastModify"), "size": record.get("size")}
+        fid = record.get("fid")
+        if fid is None or fid == "":
+            raise ValueError("AnyTXT candidate is missing fid")
+        if not os.path.isfile(absolute):
+            raise ValueError("AnyTXT candidate file does not exist")
+        result = {"path": absolute, "fid": fid, "lastModify": record.get("lastModify"), "size": record.get("size")}
         result["_term"] = record.get("_term", "")
         return result
 

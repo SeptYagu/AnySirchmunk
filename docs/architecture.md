@@ -45,7 +45,7 @@ flowchart TD
     B -->|anytxt| H[FallbackRetriever]
     H --> A[AnyTXTRetriever]
     H -. 故障回退 .-> G
-    A --> RPC[AnyTXT 全局索引 JSON-RPC :9920]
+    A --> RPC[AnyTXT 全局索引 v1 JSON-RPC :9924/rpc]
     A --> N[标准化检索事件]
     G --> N
     N --> T[KeywordSearchTool]
@@ -84,7 +84,8 @@ class AnyTXTRetriever(BaseRetriever):
 
 ### 4.2 RPC 调用
 
-已验证的搜索方法：
+默认 v1 搜索方法为 `anytxt.v1.getResult`，参数直接位于 `params`；以下为旧版
+legacy 接口 `ATRpcServer.Searcher.V1.GetResult` 的等价参数示意：
 
 ```json
 {
@@ -104,7 +105,7 @@ class AnyTXTRetriever(BaseRetriever):
 
 响应会给出字段描述及文件记录，当前验证到的字段为 `fid`、`lastModify`、`size` 和 `file`。
 
-片段方法：
+默认 v1 片段方法为 `anytxt.v1.getFragment`；以下为 legacy 片段方法：
 
 ```json
 {
@@ -116,7 +117,9 @@ class AnyTXTRetriever(BaseRetriever):
 }
 ```
 
-匹配文本从响应的 `output.text` 读取。请求必须使用 JSON-RPC 2.0 信封（`params.input`），并同时带 `Accept: application/json` 和 `Content-Type: application/json`；缺少任一头部时服务端返回 `HTTP 400`，裸 `{"method": ..., "input": ...}` 形式则不会得到响应。
+匹配文本从响应的 `output.text` 读取。请求必须使用 JSON-RPC 2.0 信封并同时带
+`Accept: application/json` 和 `Content-Type: application/json`。v1 参数直接位于 `params`，
+legacy 参数位于 `params.input`；缺少任一头部时服务端返回 `HTTP 400`。
 
 RPC 地址、请求限制和超时都由配置提供。用户明确指定一个或多个根目录时，每个根目录分别请求，结果再按规范化后的绝对路径去重。
 
@@ -307,7 +310,7 @@ AnyTXT 只改变候选文件的发现方式。候选文件进入 Sirchmunk 后�
 
 记录候选 recall@K（相同 K）、检索阶段 P50/P95、RPC 次数、片段字符数、完整性、回退率；LLM 答案总时延另列。暂定发布门槛：共同支持的查询集上 AnyTXT 平均 recall@K 不低于 rga，热缓存检索 P95 不高于 rga 的 80%；精确语义测试全部通过。该门槛是待实测的目标，不是已达到的性能结论；调整需注明原因，不能在失败后直接宣称通过。
 
-预算分为候选发现与片段两部分：候选发现默认单次 RPC 5 秒、整次 retrieve 30 秒、并发 2、总 RPC 100、候选文件 3000；片段默认 100 次请求、片段总量 100000 字符。片段预算独立，避免大量片段请求把候选发现的分页预算耗尽，两者共享同一个截止时间。任一预算耗尽都只把结果标记为不完整（`complete=false` 与对应 reason），已发现的候选必须保留，不得丢弃候选或向调用方抛出预算异常；取消仍然向上传递，预算耗尽也不启动回退。能力探测、所有关键词与目录、分页、片段及回退均计入适用预算；每次 RPC 超时取配置的单次超时与剩余预算较小值，调用方 timeout 与配置总预算取较小值。预算值均可配置，名称与默认值见需求 FR-8；并发由共享信号量约束，并由方法类别闸门（`_KindGate`）保证 `GetResult` 与 `GetFragment` 不会同时处于请求中。单次 retrieve 的预算不代表整个多轮 DEEP 查询预算，外层取消或截止时间也须向下传递。线程包装 HTTP 时取消不能强制终止已运行线程，必须验证连接超时和资源释放，并停止提交新请求。
+预算分为候选发现与片段两部分：候选发现默认单次 RPC 15 秒、整次 retrieve 30 秒、并发 2、总 RPC 100、候选文件 3000；片段默认 100 次请求、片段总量 100000 字符。片段预算独立，避免大量片段请求把候选发现的分页预算耗尽，两者共享同一个截止时间。任一预算耗尽都只把结果标记为不完整（`complete=false` 与对应 reason），已发现的候选必须保留，不得丢弃候选或向调用方抛出预算异常；取消仍然向上传递，预算耗尽也不启动回退。能力探测、所有关键词与目录、分页、片段及回退均计入适用预算；每次 RPC 超时取配置的单次超时与剩余预算较小值，调用方 timeout 与配置总预算取较小值。预算值均可配置，名称与默认值见需求 FR-8；进程级 `_EndpointGate` 按 API 端点跨客户端共享，同时限制同类 RPC 并发并保证 `GetResult` 与 `GetFragment` 不会同时处于实际 HTTP 请求中。单次 retrieve 的预算不代表整个多轮 DEEP 查询预算，外层取消或截止时间也须向下传递。线程包装 HTTP 时取消不能强制终止已运行线程，因此闸门由工作线程持有到传输实际结束；排队线程收到取消标志后不得再提交请求。
 
 ### 工程检查
 

@@ -14,6 +14,9 @@ data/
 logs/
 *.log
 
+# Local agent workspace (project memory stays on this machine)
+.workbuddy/
+
 # Editor and OS files
 .idea/
 .vscode/

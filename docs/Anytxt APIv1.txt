@@ -1,0 +1,396 @@
+Anytxt API v1 and MCP 
+Anytxt exposes a local JSON-RPC 2.0 API and a Model Context Protocol (MCP) Streamable HTTP endpoint from the ATGUI process. 
+Interface
+URL
+Versioning
+Help
+http://127.0.0.1:9924/
+Open directly in a web browser
+JSON-RPC API
+http://127.0.0.1:9924/rpc
+Method namespace anytxt.v1
+MCP
+http://127.0.0.1:9924/mcp
+Negotiated by MCP initialize
+
+ATGUI must be running and the SDK feature must be enabled by the current license. The service binds to loopback only. The URL has no /v1 segment: API versions are carried by JSON-RPC method names, while MCP negotiates its protocol version during initialization. 
+JSON-RPC API 
+Request format 
+Send a JSON-RPC 2.0 object to /rpc. Parameters are placed directly inside params. 
+curl --location 'http://127.0.0.1:9924/rpc' \
+  --header 'Accept: application/json' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "anytxt.v1.status",
+    "params": {}
+  }' 
+A successful JSON-RPC response has a result member. Anytxt business results use this shape: 
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "errno": 0,
+    "data": {
+      "input": {},
+      "output": {}
+    }
+  }
+} 
+errno is the Anytxt operation result. JSON-RPC protocol or parameter errors are returned in the top-level error member. 
+Methods 
+Method
+Purpose
+anytxt.v1.search
+Count indexed files matching a search expression.
+anytxt.v1.getResult
+Return paginated matching file metadata.
+anytxt.v1.getFragment
+Return one matching text fragment for a file ID.
+anytxt.v1.getFragmentAll
+Return multiple matching fragments for a file ID.
+anytxt.v1.getText
+Return indexed text for a file ID.
+anytxt.v1.syncIndex
+Synchronize the index for a folder.
+anytxt.v1.status
+Check whether the search engine has finished loading.
+anytxt.v1.ocr
+Extract text from an image. Available in OCR-enabled builds.
+
+Search count 
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "anytxt.v1.search",
+  "params": {
+    "pattern": "\"This is\" !that",
+    "filterDir": "C:\\Documents",
+    "filterExt": "doc;docx;pdf",
+    "lastModifyBegin": 0,
+    "lastModifyEnd": 2147483647
+  }
+} 
+Parameter
+Type
+Required
+Description
+pattern
+string
+Yes
+Anytxt search expression. Advanced search syntax is supported.
+filterDir
+string
+No
+Directory filter. Defaults to C: on Windows or / on Linux.
+filterExt
+string
+No
+Extension filter such as * or doc;pdf. Defaults to *.
+lastModifyBegin
+integer
+No
+Minimum Unix modification timestamp. Defaults to 0.
+lastModifyEnd
+integer
+No
+Maximum Unix modification timestamp. 0 means no upper filter.
+
+The result contains data.output.count. 
+Get results 
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "anytxt.v1.getResult",
+  "params": {
+    "pattern": "Hello",
+    "filterDir": "C:\\",
+    "filterExt": "*",
+    "limit": 30,
+    "offset": 0,
+    "order": 0,
+    "lastModifyBegin": 0,
+    "lastModifyEnd": 2147483647
+  }
+} 
+This method accepts the search parameters above plus: 
+Parameter
+Type
+Required
+Description
+limit
+integer
+No
+Must be between 1 and 300. Omitted values use 300.
+offset
+integer
+No
+Zero-based result offset. Must be 0 or greater; omitted values use 0.
+order
+integer
+No
+0 default, 1 modified ascending, 2 modified descending, 3 path ascending, 4 path descending.
+
+The result contains data.output.field, data.output.count, and data.output.files. File fields are fid, lastModify, size, and file. 
+Get one fragment 
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "method": "anytxt.v1.getFragment",
+  "params": {
+    "fid": "9223736511748752040",
+    "pattern": "Hello"
+  }
+} 
+The result text is in data.output.text. 
+Get all fragments 
+{
+  "jsonrpc": "2.0",
+  "id": 13,
+  "method": "anytxt.v1.getFragmentAll",
+  "params": {
+    "fid": "9223736511748752040",
+    "pattern": "Hello",
+    "limit": 10
+  }
+} 
+The result contains data.output.text as an array and data.output.count. 
+Get indexed text 
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "method": "anytxt.v1.getText",
+  "params": {
+    "fid": "9223736511748752040"
+  }
+} 
+The result text is in data.output.text. 
+Use a decimal string for fid in JavaScript and other environments that cannot represent every unsigned 64-bit integer exactly. A positive JSON integer is also accepted when the client preserves 64-bit precision. 
+Synchronize a folder 
+{
+  "jsonrpc": "2.0",
+  "id": 15,
+  "method": "anytxt.v1.syncIndex",
+  "params": {
+    "folder": "C:\\Documents"
+  }
+} 
+Search engine status 
+{
+  "jsonrpc": "2.0",
+  "id": 16,
+  "method": "anytxt.v1.status",
+  "params": {}
+} 
+The Boolean state is in data.output.return. 
+OCR 
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "anytxt.v1.ocr",
+  "params": {
+    "file": "C:\\Images\\scan.png"
+  }
+} 
+This method is available only when ATGUI is built with OCR support. Extracted text is returned in data.output.text. 
+JSON-RPC errors and limits 
+Code
+Meaning
+-32700
+Invalid JSON.
+-32600
+Invalid JSON-RPC request.
+-32601
+Method not found.
+-32602
+Missing parameter or invalid parameter type/value.
+-32603
+Internal error while executing the method.
+
+The maximum HTTP request body is 1 MiB.
+A JSON-RPC notification has no id and receives HTTP 204 with no response body.
+Batch requests are supported. An empty batch is invalid.
+Requests with a non-loopback Host or Origin are rejected with HTTP 403. 
+
+Model Context Protocol 
+Configure an MCP client with the Streamable HTTP URL: 
+http://127.0.0.1:9924/mcp 
+The server currently negotiates MCP protocol version 2025-03-26. A client must initialize a session, send notifications/initialized, and then call tools using the returned Mcp-Session-Id header. 
+Initialize 
+curl --include --location 'http://127.0.0.1:9924/mcp' \
+  --header 'Accept: application/json, text/event-stream' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-03-26",
+      "capabilities": {},
+      "clientInfo": { "name": "Example Client", "version": "1.0" }
+    }
+  }' 
+Read the Mcp-Session-Id response header and use it for all later requests in that session. 
+Mark the session initialized 
+curl --location 'http://127.0.0.1:9924/mcp' \
+  --header 'Accept: application/json, text/event-stream' \
+  --header 'Content-Type: application/json' \
+  --header 'Mcp-Session-Id: <SESSION_ID>' \
+  --header 'MCP-Protocol-Version: 2025-03-26' \
+  --data '{
+    "jsonrpc": "2.0",
+    "method": "notifications/initialized",
+    "params": {}
+  }' 
+Available tools 
+Tool
+Arguments
+Description
+anytxt_search
+pattern required; optional filterDir, filterExt, limit, offset, order, lastModifyBegin, lastModifyEnd
+Search indexed files. MCP page size is limited to 100.
+anytxt_get_text
+fid
+Read indexed text for a file ID returned by anytxt_search.
+anytxt_get_fragment
+fid, pattern
+Read a matching fragment for a file.
+anytxt_get_fragment_all
+fid, pattern; optional topK (default: 10)
+Read multiple matching fragments for a file.
+anytxt_sync_index
+folder
+Synchronize the AnyTXT index for a folder.
+anytxt_ocr
+file
+Extract text from an image file.
+anytxt_status
+None
+Check whether the search engine has finished loading.
+
+List tools 
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list",
+  "params": {}
+} 
+Call a tool 
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "anytxt_search",
+    "arguments": {
+      "pattern": "Hello",
+      "filterDir": "C:\\Documents",
+      "filterExt": "pdf;docx",
+      "limit": 30,
+      "offset": 0
+    }
+  }
+} 
+Tool results use MCP text content. The text is a serialized JSON Anytxt result: 
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "isError": false,
+    "content": [
+      { "type": "text", "text": "{...Anytxt JSON result...}" }
+    ]
+  }
+} 
+anytxt_get_text limits returned UTF-8 text to 1 MiB. A truncated result includes data.output.truncated: true and data.output.originalBytes. 
+Close a session 
+curl --request DELETE 'http://127.0.0.1:9924/mcp' \
+  --header 'Mcp-Session-Id: <SESSION_ID>' \
+  --header 'MCP-Protocol-Version: 2025-03-26' 
+ATGUI allows up to 16 concurrent MCP sessions.
+Inactive sessions expire after 300 seconds.
+A missing session header returns HTTP 400; an unknown or expired session returns HTTP 404.
+When the session limit is reached, initialize returns HTTP 503. 
+
+
+
+
+全文检索语法
+操作符(是英文符号):
+实例
+解释
+test & hello
+与，该操作符前后的词将都会包含。
+test | hello
+或，该操作符前后的词将至少包含一个。
+test !hello
+非，包含该操作后面的词的搜索结果将会排除。
+"hello word"
+完全匹配，和“精准搜索”一样效果，双引号内的词组不会被拆分。
+(test | "hello word") !this
+匹配包含 test 或完整短语“hello word”的内容，并排除包含 this 的内容。
+test & (hello | "this is") !that
+匹配包含 test，且包含 hello 或完整短语“this is”的内容，并排除包含 that 的内容。
+
+
+列表过滤语法
+文件名、目录和文件类型
+实例
+解释
+report & (annual | summary) !draft
+匹配包含 report，且包含 annual 或 summary 的文件名或目录，并排除包含 draft 的结果。
+.pdf | .docx
+匹配文件类型为 PDF 或 DOCX 的文件。
+
+文件大小
+支持 B、KB、MB、GB、TB 单位（也可使用 K、M、G、T）、比较操作和范围过滤。
+实例
+解释
+=1GB
+按输入单位 GB 换算并保留两位小数后，匹配满足“= 1.00”的文件。
+<10MB
+按输入单位 MB 换算并保留两位小数后，匹配满足“< 10.00”的文件。
+<=500KB
+按输入单位 KB 换算并保留两位小数后，匹配满足“<= 500.00”的文件。
+>2M
+按输入单位 MB 换算并保留两位小数后，匹配满足“> 2.00”的文件。
+>=2GB
+按输入单位 GB 换算并保留两位小数后，匹配满足“>= 2.00”的文件。
+2MB-10MB
+按输入单位换算并保留两位小数后，匹配从 2.00 MB 到 10.00 MB 的文件，范围两端都包含。
+2MB~10MB
+按输入单位换算并保留两位小数后，匹配从 2.00 MB 到 10.00 MB 的文件，范围两端都包含。
+2M
+按输入单位换算并保留两位小数后，匹配从 2.00 MB 到 2.99 MB 的文件。
+2.2M
+按输入单位换算并保留两位小数后，匹配从 2.20 MB 到 2.29 MB 的文件。
+2.20M
+按输入单位换算后，严格匹配保留两位小数为 2.20 MB 的文件。
+2
+请始终填写单位。当前版本未写单位时按 Byte 处理。
+
+列表会根据文件大小自动切换 KB、MB、GB 和 TB；过滤始终使用输入的固定单位。
+在 1 MB、1 GB 等单位切换点附近，过滤使用的单位可能与列表当前显示的单位不同。
+修改时间
+支持年份、日期和精确到秒的日期时间；日期可使用 - 或 /，范围可使用 - 或 ~ 分隔。
+实例
+解释
+2025
+匹配修改时间在 2025 年内的所有文件。
+2025-10-21
+匹配 2025 年 10 月 21 日全天；日期分隔符 - 和 / 均可使用。
+2025/10/21
+匹配 2025 年 10 月 21 日全天；日期分隔符 - 和 / 均可使用。
+2025-10-21 14:25:36
+匹配修改时间落在 2025-10-21 14:25:36 这一秒内的文件。
+>=2025-01-01
+匹配修改时间大于或等于 2025-01-01 00:00:00 的文件。
+<2025-10-21 14:25:36
+匹配修改时间早于 2025-10-21 14:25:36 的文件。
+2025~2026
+匹配从 2025 年开始到 2026 年结束的所有修改时间，包含范围两端。
+2025-01-01~2025-12-31 23:59:59
+匹配修改时间位于指定范围内的文件，包含范围两端。
+
+未指定时间的日期或年份表示完整的一天或一年。不同列的过滤条件按“与”关系组合。

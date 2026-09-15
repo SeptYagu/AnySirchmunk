@@ -104,6 +104,8 @@ git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
 .\scripts\verify.ps1 -SirchmunkPath .\sirchmunk
 ```
 
+带 `-SirchmunkPath` 的验证会同时核对锁定 commit 和当前补丁的反向预检；目标仍是旧补丁、只应用了部分补丁或已发生冲突性漂移时会失败，而不是仅凭 Python 编译成功放行。
+
 随后按 Sirchmunk 自身说明安装依赖，在其 `.env` 中显式启用：
 
 ```dotenv

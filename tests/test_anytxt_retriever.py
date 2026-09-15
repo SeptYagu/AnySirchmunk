@@ -243,6 +243,28 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metadata["actual_backend"], "rga")
         self.assertEqual(len(fallback.calls), 1)
 
+    async def test_partially_overlapping_pages_never_claim_exact_completeness(self):
+        root = r"D:\docs"
+        first = [
+            {"fid": "1", "file": r"D:\docs\a.pdf"},
+            {"fid": "2", "file": r"D:\docs\b.pdf"},
+        ]
+        second = [
+            {"fid": "2", "file": r"D:\docs\b.pdf"},
+            {"fid": "3", "file": r"D:\docs\c.pdf"},
+        ]
+        client = FakeClient(
+            {("alpha", root, 0): (first, 2), ("alpha", root, 2): (second, 2)},
+            totals={("alpha", root): 4},
+        )
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2), client=client)
+        with patch.object(mod.os.path, "isfile", return_value=True):
+            events = await retriever.retrieve("alpha", path=root, literal=True, regex=False)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("overlapping_page", events.metadata["reason"])
+        self.assertIn("incomplete_enumeration", events.metadata["reason"])
+        self.assertEqual(events.metadata["candidates"], 3)
+
     async def test_global_failure_only_falls_back_to_configured_roots(self):
         class Broken(FakeClient):
             async def search(self, *args, **kwargs):
@@ -349,6 +371,44 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
             [r"D:\lib\a.pdf", r"D:\lib\b.pdf"],
         )
 
+    async def test_exact_logic_budget_exhaustion_never_starts_fallback(self):
+        root = r"D:\lib"
+        pages = {
+            ("alpha", root, 0): ([
+                {"fid": "1", "file": r"D:\lib\a.pdf"},
+                {"fid": "2", "file": r"D:\lib\b.pdf"},
+            ], 2),
+        }
+        fallback = FakeFallback()
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=2, max_requests=3),
+            client=FakeClient(pages),
+            fallback=fallback,
+        )
+        with patch.object(mod.os.path, "isfile", return_value=True):
+            events = await retriever.retrieve(
+                ["alpha", "beta"], path=root, logic="and", literal=True, regex=False
+            )
+        self.assertEqual(fallback.calls, [])
+        self.assertEqual(events.metadata["actual_backend"], "anytxt")
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("budget_exhausted", events.metadata["reason"])
+        self.assertIn("exact_logic_incomplete", events.metadata["reason"])
+        self.assertEqual(list(events), [])
+
+    async def test_exact_candidate_limit_is_not_reported_as_truncation(self):
+        root = r"D:\lib"
+        pages = {("alpha", root, 0): ([{"fid": "1", "file": r"D:\lib\only.pdf"}], 1)}
+        client = FakeClient(pages, totals={("alpha", root): 1})
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=2, max_candidates=1), client=client
+        )
+        with patch.object(mod.os.path, "isfile", return_value=True):
+            events = await retriever.retrieve("alpha", path=root, literal=True, regex=False)
+        self.assertTrue(events.metadata["complete"])
+        self.assertIsNone(events.metadata["reason"])
+        self.assertEqual(events.metadata["candidates"], 1)
+
     async def test_fragment_budget_exhaustion_keeps_every_candidate(self):
         root = r"D:\lib"
         pages = {("alpha", root, 0): ([
@@ -410,6 +470,16 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events.metadata["complete"])
         self.assertIn("invalid_record", events.metadata["reason"])
         self.assertEqual(client.fragment_calls, [])
+
+    async def test_unhashable_fid_is_skipped_instead_of_crashing_page_detection(self):
+        root = r"D:\lib"
+        rows = [{"fid": ["not", "hashable"], "file": r"D:\lib\bad.pdf"}]
+        client = FakeClient({("alpha", root, 0): (rows, 1)}, totals={("alpha", root): 1})
+        retriever = mod.AnyTXTRetriever(config=config(page_size=2), client=client)
+        events = await retriever.retrieve("alpha", path=root, literal=True, regex=False)
+        self.assertEqual(list(events), [])
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("invalid_record", events.metadata["reason"])
 
     async def test_budget_exhaustion_before_first_request_returns_metadata(self):
         retriever = mod.AnyTXTRetriever(
@@ -975,6 +1045,11 @@ class DeliveryArtifactTests(unittest.TestCase):
                      "src/sirchmunk/retrieve/anytxt_retriever.py", "src/sirchmunk/search.py"):
             with self.subTest(path=path):
                 self.assertIn(f"diff --git a/{path}", patch_text)
+
+    def test_verify_script_checks_the_installed_patch_identity(self):
+        script = (MODULE_PATH.parents[3] / "scripts" / "verify.ps1").read_text(encoding="utf-8")
+        self.assertIn("rev-parse HEAD", script)
+        self.assertIn("apply --reverse --check --whitespace=error-all", script)
 
 
 if __name__ == "__main__":

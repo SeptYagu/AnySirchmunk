@@ -1,15 +1,15 @@
-# AnySirchmunk 交接：v1-only 适配完成后的剩余工作
+# AnySirchmunk 交接：v1-only 适配审查修复后的剩余工作
 
-日期：2026-09-15（第三轮收尾）
+日期：2026-09-15（第四轮代码审查修复）
 
 分支：`main`　上游基线：Sirchmunk `3c7ee54f93fa198db2020a3ab850356f2dacff72`
 
 ## 0. 一句话状态
 
 **AnyTXT v1-only 适配已完成并验收**：接口只剩 `anytxt.v1.*`（`127.0.0.1:9924/rpc`，1.3.3541+），
-legacy `9920` 的全部代码路径、配置项、探针选项、文档与交付模板都已移除；契约测试 39 → 57；
+legacy `9920` 的全部代码路径、配置项、探针选项、文档与交付模板都已移除；契约测试 39 → 62；
 FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超时，服务 PID 未变。
-剩余工作见 §3。
+第四轮又修复了分页完整性、预算回退、候选上限、非法 `fid` 和安装验证五项问题；剩余工作见 §3。
 
 历史文档（本文件的前两版）：
 
@@ -42,6 +42,17 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 | P4 | 30 查询召回与性能基准；运行时能力探测状态机 | ⬜ 未做 |
 | — | 验收记录 | ✅ `2720999` |
 
+### 2.1 第四轮代码审查修复
+
+- 精确计数现在按每个 scope 的唯一 `fid` 对账；跨页部分重叠会标记
+  `overlapping_page`，唯一记录数与总数不一致会标记 `incomplete_enumeration`，不再以原始行数误报完整。
+- 请求或候选预算使 AND/NOT 不完整时不再启动 `rga` 回退；返回
+  `exact_logic_incomplete`，并只保留可证明安全的子集（未搜索完全部 AND 项或任何不完整 NOT 均不返回候选）。
+- 候选预算按规范化路径后的唯一文件计数，只在尝试加入第 N+1 个唯一候选时触发；恰好达到上限不再误报截断。
+- 非字符串/空 `fid` 在记录验证阶段标为 `invalid_record`，页签名也始终可哈希，不再让整个查询抛 `TypeError`。
+- `scripts/verify.ps1 -SirchmunkPath` 现在核对锁定 HEAD，并要求当前补丁可反向预检；旧补丁、部分补丁或漂移安装不能仅靠编译通过。
+- 以上各有回归测试；当前契约测试共 62 个，补丁对锁定基线的 apply check 通过。
+
 关键取证（都改变了实现，详见 `docs/anytxt-capabilities.md` §4.1–4.7）：
 
 - `result.errno` 是业务状态：未索引卷与无法解析的 `fid` 都返回 `errno = 1` + 空载荷，
@@ -54,8 +65,8 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 
 ### 3.1 P3-①：用服务端表达式取代客户端集合运算
 
-现状：多关键词的 AND/OR/NOT 在客户端对"已收集的文件集合"求交并差，因此集合不完整时
-`logic in {and, not}` 会抛 `AnyTXTIncompleteResults` 并回退 rga（有测试固定该行为）。
+现状：多关键词的 AND/OR/NOT 在客户端对"已收集的文件集合"求交并差，因此非预算原因造成集合不完整时
+`logic in {and, not}` 会抛 `AnyTXTIncompleteResults` 并按范围回退 rga；预算受限时禁止回退并返回明确的不完整状态。
 
 价值：v1 原生支持 `a & b !c` 与 `"短语"`（实测 D 盘 `partimento & fugue !mozart` → 32）。
 改成表达式后一次请求即可表达多词逻辑，请求数从"每词每卷"降到"每表达式每卷"，
@@ -103,7 +114,7 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 ## 4. 验收与复现入口
 
 ```bash
-# 契约测试（应为 57 个）
+# 契约测试（应为 62 个）
 python -m unittest discover -s tests
 # 补丁三重校验
 git worktree add --detach <原生路径> 3c7ee54f93fa198db2020a3ab850356f2dacff72
@@ -126,8 +137,9 @@ sirchmunk search "partimento" --mode FAST --work-path 'D:\OneDrive\SirchmunkData
 
 ## 5. 环境状态
 
-- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，**已应用最新补丁**；
-  另有用户自己的 `web/package-lock.json` 改动，勿动。
+- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，但仍是第四轮之前的旧补丁；
+  当前补丁的反向预检会失败，必须先按旧交付状态安全回滚或重建干净 worktree，再应用本轮补丁。
+  不要用当前 `rollback.ps1` 强行处理旧补丁，也不要覆盖其中已有的用户改动。
 - `D:\OneDrive\SirchmunkData`：工作目录；知识 parquet 已随 DEEP 验收更新（26 353 字节，13:15）。
 - AnyTXT 1.3.3541，`ATGUI.exe` 当前 PID 42368，同时监听 `9920` 与 `9924`（只有 9924 被使用）。
 - 临时探测脚本留在 `.workbuddy/tmp/`（gitignored），可作为契约证据重放。

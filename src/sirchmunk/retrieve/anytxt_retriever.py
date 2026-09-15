@@ -670,6 +670,7 @@ class AnyTXTRetriever(BaseRetriever):
             reasons.append(ENGINE_NOT_READY_REASON)
             logger.warning("AnyTXT reports that its search engine has not finished loading")
         per_term: List[Dict[str, Dict[str, Any]]] = []
+        candidate_keys: set[str] = set()
         for term in terms:
             found: Dict[str, Dict[str, Any]] = {}
             filter_ext = _file_type_glob(file_type)
@@ -692,9 +693,12 @@ class AnyTXTRetriever(BaseRetriever):
                             continue
                         expected = total.total
                 offset = 0
-                received_total = 0
+                unique_received_total = 0
                 halt_scopes = False
                 seen_pages: set[tuple[Any, ...]] = set()
+                seen_fids: set[str] = set()
+                if expected == 0:
+                    continue
                 while True:
                     try:
                         page = await self.client.search(term, scope, filter_ext, offset, self.config.page_size, budget)
@@ -709,14 +713,23 @@ class AnyTXTRetriever(BaseRetriever):
                         complete = False
                         reasons.append(f"scope_errno_{page.errno}")
                         break
-                    signature = tuple(record.get("fid") for record in page.files)
+                    signature = tuple(_record_signature(record) for record in page.files)
                     if signature and signature in seen_pages:
                         complete = False
                         reasons.append("repeated_page")
                         halt_scopes = True
                         break
                     seen_pages.add(signature)
-                    received_total += len(page.files)
+                    for record in page.files:
+                        fid = record.get("fid")
+                        if not isinstance(fid, str) or not fid:
+                            continue
+                        if fid in seen_fids:
+                            complete = False
+                            reasons.append("overlapping_page")
+                            continue
+                        seen_fids.add(fid)
+                        unique_received_total += 1
                     candidate_budget_hit = False
                     for record in page.files:
                         tagged_record = dict(record, _term=term)
@@ -730,20 +743,26 @@ class AnyTXTRetriever(BaseRetriever):
                             continue
                         key = _path_key(candidate["path"])
                         if key not in found:
-                            found[key] = candidate
-                            if sum(len(group) for group in per_term) + len(found) >= self.config.max_candidates:
+                            if key not in candidate_keys and len(candidate_keys) >= self.config.max_candidates:
                                 complete = False
                                 reasons.append("candidate_budget")
                                 candidate_budget_hit = True
                                 break
+                            found[key] = candidate
+                            candidate_keys.add(key)
                     if candidate_budget_hit:
                         halt_scopes = True
                         break
-                    if expected is not None and received_total >= expected:
-                        # Every record the count promised has been delivered.
-                        break
+                    if expected is not None:
+                        if unique_received_total == expected:
+                            # Every distinct record the count promised has been delivered.
+                            break
+                        if unique_received_total > expected:
+                            complete = False
+                            reasons.append("count_mismatch")
+                            break
                     if len(page.files) < self.config.page_size:
-                        if expected is not None and received_total < expected:
+                        if expected is not None and unique_received_total != expected:
                             # The server promised more records than it served.
                             complete = False
                             reasons.append("incomplete_enumeration")
@@ -755,9 +774,23 @@ class AnyTXTRetriever(BaseRetriever):
             if "budget_exhausted" in reasons:
                 break
 
-        if logic in {"and", "not"} and not complete:
+        exact_logic_incomplete = logic in {"and", "not"} and not complete
+        budget_limited = any(reason in {"budget_exhausted", "candidate_budget"} for reason in reasons)
+        if exact_logic_incomplete and not budget_limited:
             raise AnyTXTIncompleteResults(f"{logic.upper()} requires complete upstream sets")
-        selected = self._combine(per_term, logic)
+        if exact_logic_incomplete:
+            # A budget stop is terminal and must not start an expensive fallback.
+            # For AND, only the intersection of every collected term group is a
+            # sound subset; if a term was never searched there is no sound result.
+            # For NOT, an incomplete exclusion set cannot prove any candidate safe.
+            reasons.append("exact_logic_incomplete")
+            selected = (
+                self._combine(per_term, logic)
+                if logic == "and" and len(per_term) == len(terms)
+                else {}
+            )
+        else:
+            selected = self._combine(per_term, logic)
         events: List[Dict[str, Any]] = []
         fragment_chars = 0
         fragment_cache: Dict[tuple[Any, str], Optional[str]] = {}
@@ -880,8 +913,8 @@ class AnyTXTRetriever(BaseRetriever):
         if exclude and any(_matches_glob(relative, pattern) for pattern in exclude):
             return None
         fid = record.get("fid")
-        if fid is None or fid == "":
-            raise ValueError("AnyTXT candidate is missing fid")
+        if not isinstance(fid, str) or not fid:
+            raise ValueError("AnyTXT candidate fid must be a non-empty string")
         if not os.path.isfile(absolute):
             raise ValueError("AnyTXT candidate file does not exist")
         result = {"path": absolute, "fid": fid, "lastModify": record.get("lastModify"), "size": record.get("size")}
@@ -961,6 +994,16 @@ def _normalise_files(value: Any, fields: Any) -> List[Dict[str, Any]]:
         for index in range(max(lengths, default=0)):
             result.append({name: column[index] for name, column in value.items() if isinstance(column, list) and index < len(column)})
     return result
+
+
+def _record_signature(record: Dict[str, Any]) -> tuple[str, str]:
+    """Return a hashable page identity even for malformed service records."""
+    fid = record.get("fid")
+    file_path = record.get("file")
+    return (
+        fid if isinstance(fid, str) else repr(fid),
+        file_path if isinstance(file_path, str) else repr(file_path),
+    )
 
 
 def _search_params(

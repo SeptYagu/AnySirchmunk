@@ -41,12 +41,13 @@ flowchart LR
 
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
-ANYTXT_API_MODE=v1
 ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 ANYTXT_SEARCH_LIMIT=300
 ANYTXT_REQUEST_TIMEOUT=15
 ANYTXT_TOTAL_TIMEOUT=30
 ANYTXT_MAX_CONCURRENCY=2
+ANYTXT_PAGE_ORDER=3
+ANYTXT_EXACT_COUNT=true
 ANYTXT_MAX_REQUESTS=100
 ANYTXT_MAX_CANDIDATES=3000
 ANYTXT_MAX_FRAGMENT_CHARS=100000
@@ -58,7 +59,16 @@ ANYTXT_FALLBACK_ROOTS=[]
 
 默认配置仍将保持 Sirchmunk 原有行为。只有显式选择 `anytxt` 后才使用 AnyTXT 索引。
 
-`ANYTXT_SEARCH_LIMIT` 是页大小。`ANYTXT_GLOBAL_ROOTS` 定义“用户没有指定目录”时的检索范围：AnyTXT 的 RPC 没有枚举已索引卷的方法，而且把空 `filterDir` 解析成它自己的当前目录（实测只返回 C 盘），所以不配置它时只查询那个默认目录，结果会被标记为不完整（`unverified_global_scope`）并输出告警，而不会冒充全局结果。本机索引覆盖多个卷时，应按上面示例逐卷列出。
+接口只有一个：AnyTXT **1.3.3541 及以上**的 v1 API（`anytxt.v1.*`，默认
+`http://127.0.0.1:9924/rpc`）。旧版 9920 的 legacy 接口已移除；`.env` 里若还留着
+`ANYTXT_API_MODE=legacy`，程序会在启动时直接报错，而不是换一套参数静默继续。
+
+`ANYTXT_SEARCH_LIMIT` 是页大小，取值范围 1–300（越界会在启动时报配置错误，不会等到查询中途
+收到 `-32602`）。`ANYTXT_PAGE_ORDER` 默认 3（路径升序），用于让分页顺序确定；`ANYTXT_EXACT_COUNT`
+默认为真，会为每个关键词和目录多发一次 `anytxt.v1.search` 以取得精确命中总数，从而把"是否已取全"
+从启发式变成可判定的结论（设为 false 则退回原有的分页启发式）。
+
+`ANYTXT_GLOBAL_ROOTS` 定义“用户没有指定目录”时的检索范围：AnyTXT 的 RPC 没有枚举已索引卷的方法，而且把空 `filterDir` 解析成它自己的当前目录（1.3.2477 与 1.3.3541 实测都只返回 C 盘），所以不配置它时只查询那个默认目录，结果会被标记为不完整（`unverified_global_scope`）并输出告警，而不会冒充全局结果。本机索引覆盖多个卷时，应按上面示例逐卷列出。目录存在但未被索引时，服务返回 `errno = 1`，该目录会被记为 `scope_errno_1` 且结果不完整，其他目录的命中仍然保留。
 
 全局搜索失败后，仅在 `ANYTXT_FALLBACK_ROOTS` 配置了绝对目录 JSON 数组时才回退，并明确结果范围已缩小；不会自动扫描当前目录或整盘。文件名搜索也需要明确目录。完整预算配置见需求文档 FR-8。
 
@@ -78,7 +88,7 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 
 - Windows
 - AnyTXT Searcher 1.3.3541 或更高版本已安装、正在运行并完成文献索引
-- AnyTXT v1 本地 API 可通过 `http://127.0.0.1:9924/rpc` 访问
+- AnyTXT v1 本地 API 可通过 `http://127.0.0.1:9924/rpc` 访问（旧版 9920 接口不受支持）
 - Sirchmunk 的 Python 环境可以正常运行
 - 已配置 Sirchmunk 使用的 LLM API
 
@@ -98,7 +108,6 @@ git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
 
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
-ANYTXT_API_MODE=v1
 ANYTXT_API_URL=http://127.0.0.1:9924/rpc
 ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
 ```
@@ -131,33 +140,33 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 - [x] 增加有界回退、完整性 metadata 和诊断日志
 - [x] 完成模拟 RPC 契约测试、真实 RPC smoke test 及补丁应用/回滚验证
 - [x] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
+- [x] 适配 AnyTXT 1.3.3541 的 v1 API，并移除 9920 的 legacy 接口
+- [x] 用 v1 的精确命中总数判定结果完整性，并区分"目录不可检索"与"目录内无命中"
 - [ ] 完成固定语料上的召回与性能基准
 
-2026-09-15 在本机完整环境（Sirchmunk `3c7ee54` + AnyTXT 1.3.2477 + `D:\OneDrive\SirchmunkData`）
-完成了端到端验收：FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`
-（`search_backend=anytxt`，事件带 `_search_backend=anytxt`）；无显式范围时按
-`ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，实测命中覆盖 C/D/E 三个卷；查询后的知识簇写入
-`.cache/knowledge/knowledge_clusters.parquet`，并能在下一次查询中复用。
+2026-09-15 在本机完整环境（Sirchmunk `3c7ee54` + `D:\OneDrive\SirchmunkData`）完成了端到端验收：
+FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`（`search_backend=anytxt`，
+事件带 `_search_backend=anytxt`）；无显式范围时按 `ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，实测命中
+覆盖 C/D/E 三个卷；查询后的知识簇写入 `.cache/knowledge/knowledge_clusters.parquet`，并能在下一次
+查询中复用。该轮验收在 1.3.2477 上完成；升级到 1.3.3541 后再用 v1 接口复跑了 FAST 与 DEEP，
+服务进程 PID 全程不变（见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.5 节）。
 
-**版本要求**：1.3.2477 的 Beta RPC 服务在长查询下会退出（实测见
-[docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.5 节），长查询需要 **1.3.3541 及以上**，
-并使用默认的 v1 接口（`ANYTXT_API_MODE=v1`，即 `http://127.0.0.1:9924/rpc`）。
-旧版本可以设 `ANYTXT_API_MODE=legacy`（9920），但只适合短查询。需要复测时用同一个探针脚本：
-
-```dotenv
-ANYTXT_API_MODE=legacy
-ANYTXT_API_URL=http://127.0.0.1:9920
-```
+**版本要求**：1.3.2477 的 Beta RPC 服务在长查询下会退出，因此接口基线定为
+**1.3.3541 及以上**的 v1 API（`http://127.0.0.1:9924/rpc`）。旧版 9920 接口及其 `params.input`
+信封已从代码、配置和文档中移除。需要复测稳定性时用同一个探针脚本：
 
 ```powershell
-python scripts/anytxt_stability_probe.py --api v1 --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300
+python scripts/anytxt_stability_probe.py --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300
 ```
 
 当前对正则、大小写敏感、whole-word、精确 count，以及包含正则元字符的
 literal 查询保持保守策略：显式范围内按配置回退到 `rga`；全局且没有
 `ANYTXT_FALLBACK_ROOTS` 时明确报不支持，不静默改变语义。
 
-本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。在已安装的 1.3.2477 中，全局 RPC 搜索使用空 `filterDir`；论坛示例中的 `"*"` 在本机返回零结果。第一版采用此兼容配置；未知版本或语义需已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。
+本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。1.3.2477 与
+1.3.3541 都实测到：全局 RPC 搜索若传空 `filterDir`，服务端会把它解析成自己的当前目录（`C:`）；
+论坛示例中的 `"*"` 在本机返回零结果。因此"全局检索"只能由 `ANYTXT_GLOBAL_ROOTS` 显式声明。
+未知版本或语义需用已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。
 
 ## 上游项目
 

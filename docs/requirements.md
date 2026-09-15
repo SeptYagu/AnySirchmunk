@@ -27,7 +27,8 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 ### FR-1：AnyTXT 连接
 
 - 通过可配置 URL 连接 AnyTXT 本地 JSON-RPC 服务。
-- 默认使用 v1 接口 `http://127.0.0.1:9924/rpc`；旧版 legacy 接口可显式配置为 `http://127.0.0.1:9920`。
+- 接口固定为 AnyTXT **1.3.3541 及以上**的 v1 API（`anytxt.v1.*`），默认地址 `http://127.0.0.1:9924/rpc`。
+  旧版 9920 的 `ATRpcServer.Searcher.V1.*` 接口不受支持：它无法支撑一次完整的长查询，且使用另一套参数信封。
 - 为每次请求设置超时。
 - 对连接失败、超时、非法响应和接口错误给出可诊断日志。
 - 不把本地 API 暴露到公网，也不要求 AnyTXT 账号或云服务。
@@ -37,7 +38,7 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 - 支持单个关键词和多个关键词。
 - 支持两类范围：显式根目录，以及由 `ANYTXT_GLOBAL_ROOTS` 声明的“未指定范围”检索范围。AnyTXT RPC 没有可枚举已索引卷的方法，空 `filterDir` 会被服务端解析为自己的当前目录，因此全局范围不能由空参数隐式表达，也不能通过扫描磁盘猜测。
 - 支持用户在需要时限定一个或多个搜索根目录。
-- v1 默认调用 `anytxt.v1.getResult` / `anytxt.v1.getFragment`；legacy 模式调用 `ATRpcServer.Searcher.V1.GetResult` / `ATRpcServer.Searcher.V1.GetFragment`。
+- 调用 `anytxt.v1.getResult` 获取候选文件，调用 `anytxt.v1.search` 获取精确命中总数，调用 `anytxt.v1.getFragment` 获取匹配片段；参数直接位于 `params`。
 - 保留 AnyTXT 返回的稳定文件标识、绝对路径、修改时间和文件大小等可用元数据。
 - 去除重复文件，并限制请求数、文件数和片段总字符数。
 - 片段请求使用独立于候选发现的请求预算；任一预算耗尽只把结果标记为不完整并保留已发现的候选，不得丢弃候选或向调用方抛出预算异常。
@@ -101,18 +102,22 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 | 变量 | 默认值 | 含义 |
 | --- | --- | --- |
 | `SIRCHMUNK_SEARCH_BACKEND` | `rga` | 选择检索后端 |
-| `ANYTXT_API_MODE` | `v1` | 选择接口：`v1`（`anytxt.v1.*`，默认 `http://127.0.0.1:9924/rpc`）或 `legacy`（`ATRpcServer.Searcher.V1.*`，默认 `http://127.0.0.1:9920`） |
-| `ANYTXT_API_URL` | 按 `ANYTXT_API_MODE` | AnyTXT 本地服务地址 |
-| `ANYTXT_SEARCH_LIMIT` | `300` | RPC 页大小，不能代替总候选预算 |
+| `ANYTXT_API_URL` | `http://127.0.0.1:9924/rpc` | AnyTXT v1 本地服务地址，必须是 loopback HTTP |
+| `ANYTXT_SEARCH_LIMIT` | `300` | RPC 页大小，取值范围 1–300（v1 越界会返回 `-32602`，故在配置阶段即校验），不能代替总候选预算 |
 | `ANYTXT_REQUEST_TIMEOUT` | `15` | 单次 RPC 超时秒数，受剩余总预算限制；超时后重试一次 |
 | `ANYTXT_FALLBACK_TO_RGA` | `true` | 内容检索故障、不支持或不完整时是否允许有界回退 |
 | `ANYTXT_FALLBACK_ROOTS` | `[]` | 全局模式回退/文件名枚举的绝对目录 JSON 数组；不改变 AnyTXT 全局检索范围 |
 | `ANYTXT_TOTAL_TIMEOUT` | `30` | 每次 retrieve 总预算秒数；与调用方 timeout 取较小值 |
-| `ANYTXT_MAX_CONCURRENCY` | `2` | 同类 RPC 请求的最大并发数；`GetResult` 与 `GetFragment` 之间强制互斥，因为 1.3.2477 在两类请求重叠时会退出服务（实测见 anytxt-capabilities.md 4.4） |
-| `ANYTXT_MAX_REQUESTS` | `100` | 每次 retrieve 的总 RPC 请求数 |
+| `ANYTXT_MAX_CONCURRENCY` | `2` | 同类 RPC 请求的最大并发数；`getResult` 与 `getFragment` 之间强制互斥，因为 1.3.2477 在两类请求重叠时会退出服务（实测见 anytxt-capabilities.md 4.4） |
+| `ANYTXT_PAGE_ORDER` | `3` | 分页排序；3 = 路径升序。默认排序不保证跨页稳定，会导致长枚举漏页或重复 |
+| `ANYTXT_EXACT_COUNT` | `true` | 是否先用 `anytxt.v1.search` 取精确命中总数；开启后完整性由"已收到的行数是否等于总数"判定，关闭则退回分页启发式 |
+| `ANYTXT_MAX_REQUESTS` | `100` | 每次 retrieve 的总 RPC 请求数（含就绪检查与精确计数） |
 | `ANYTXT_MAX_CANDIDATES` | `3000` | 每次 retrieve 的去重候选文件上限 |
 | `ANYTXT_MAX_FRAGMENT_CHARS` | `100000` | 每次 retrieve 的片段总字符上限 |
 | `ANYTXT_MAX_FRAGMENT_REQUESTS` | `100` | 每次 retrieve 的片段请求上限；片段预算独立于候选发现，避免大量片段请求饿死分页 |
+
+`ANYTXT_API_MODE` 已随 legacy 接口一起移除。若环境或 `.env` 中仍存在该变量且值不是 `v1`，
+配置解析直接报错——静默改用另一套接口属于禁止的语义漂移。
 
 配置值不得硬编码到检索逻辑中，也不得保存密钥或用户私有路径到仓库。
 
@@ -124,7 +129,7 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 
 - 保持 Sirchmunk 的公开搜索调用、API 请求和 MCP payload 兼容。
 - 未配置 AnyTXT 时保持原有默认行为。
-- 兼容当前已验证的 AnyTXT 1.3.2477 接口，不依赖更高版本才提供的全文读取接口。
+- 以 AnyTXT 1.3.3541+ 的 v1 API 为接口基线，不使用更高版本才提供的能力（`getText`、`getFragmentAll`、`ocr`、`syncIndex`、MCP）作为依赖。
 - 对 AnyTXT Beta API 的目录通配符、正则模式和版本差异进行能力探测。
 - 已锁定 Sirchmunk 完整 commit SHA、Python/依赖版本和许可证，采用固定版本补丁集交付，附干净安装、测试与回滚步骤；锁定信息见 [baseline.json](../baseline.json)。
 - 验证全局/显式范围与 FAST、DEEP 初始检索、ReAct、文件名搜索、知识复用的组合，不能仅以事件结构相同认定兼容。
@@ -190,17 +195,28 @@ AnyTXT Searcher 已经为本地文件建立全文索引，能够快速返回相�
 
 ## 8. 已验证的 AnyTXT 基线
 
-截至 2026-09-15，本机安装版本为 1.3.2477。已确认：
+截至 2026-09-15，本机安装版本为 **1.3.3541**（此前为 1.3.2477，其长查询会退出服务，已不再支持）。
+接口基线为 v1：`http://127.0.0.1:9924/rpc`。已确认：
 
-- `127.0.0.1:9920` 的 JSON-RPC 服务可访问。
-- 请求必须使用 JSON-RPC 2.0 信封（`params.input`）并同时带 `Accept: application/json` 与 `Content-Type: application/json`；裸 `{"method": ..., "input": ...}` 形式无响应，缺少任一头部返回 `HTTP 400`。
-- `GetResult` 返回 `fid`、`lastModify`、`size` 和 `file`。
-- `GetFragment` 可以返回命中片段。
-- 空 `filterDir` 会被服务端解析为它自己的当前目录（本次实测为 `C:`），只返回该卷结果，**不是**全局搜索；`filterDir="*"` 在本机返回零结果。
-- 逐卷根目录（`"C:\\"`、`"D:\\"`、`"E:\\"`）可以分别检索，各卷约 0.5 秒返回；`"C:,D:,E:"` 形式返回零结果。
-- RPC 没有枚举已索引卷的方法：`GetIndexList`、`GetDriveList`、`GetVolumeList`、`GetIndexStat`、`GetVersion`、`GetStatus` 均返回 404，因此全局范围只能由配置声明。
-- `filterExt="*.pdf"` 可以过滤 PDF。
-- 正则形式 `B.rtel`、`rhetor.*` 可以经 RPC 返回结果，但公开参数没有独立搜索模式字段，因此仍需运行时探测。
-- 当前索引规则包含 26 种格式和 11,287 个文件。
+- v1 方法的 JSON-RPC 2.0 信封为 `{"result": {"errno": 0, "data": {"input": {...}, "output": {...}}}}`，
+  参数**直接位于 `params`**；请求必须同时带 `Accept: application/json` 与
+  `Content-Type: application/json`，缺少任一头部返回 `HTTP 400`。
+- `anytxt.v1.getResult` 返回 `field`、`count` 与 `files`（字段 `fid`、`lastModify`、`size`、`file`），
+  其中 `count` 是**本页行数**，不是命中总数。
+- `anytxt.v1.search` 返回**精确命中总数**，且受 `filterExt` 约束（同一目录同一关键词：`*` 为 77，
+  `*.pdf` 为 64，`pdf;docx` 为 65），因此可以按相同过滤条件给出权威总数。
+- `anytxt.v1.getFragment` 返回 `output.text`，命中词被 `*<<*`/`*>>*` 包裹；该标记属于展示层，
+  不得进入证据。
+- `anytxt.v1.status` 返回 `output.return`（引擎是否加载完成），可用于真正的就绪检查。
+- `result.errno` 是业务状态而非传输错误：`filterDir` 指向未索引卷、`fid` 无法解析时都返回
+  `errno = 1` 与空载荷，而参数错误走 JSON-RPC `error`（缺参、`limit` 越界、`order` 越界、
+  空 `pattern`、负 `fid` 均为 `-32602`）。忽略 `errno` 会让"目录不可检索"与"目录内无命中"不可区分。
+- 空 `filterDir` 仍被服务端解析为它自己的当前目录（1.3.2477 与 1.3.3541 均为 `C:`），只返回该卷结果，
+  **不是**全局搜索；`filterDir="*"` 返回零结果。
+- 逐卷根目录（`"C:\\"`、`"D:\\"`、`"E:\\"`）可以分别检索；`"C:,D:,E:"` 形式返回零结果。
+- 没有枚举已索引卷的方法，因此全局范围只能由配置声明（`ANYTXT_GLOBAL_ROOTS`）。
+- 已移除的 9920 接口（`ATRpcServer.Searcher.V1.*`，参数嵌在 `params.input`）在 1.3.3541 上仍可响应
+  单次请求，但在真实 DEEP 负载下会让服务重启，故不再支持。
+- 参数约束：`limit` ∈ [1, 300]、请求体上限 1 MiB、非 loopback 的 Host/Origin 返回 `403`。
 
-完整格式清单、数量、官方版本差异和证据来源见 [anytxt-capabilities.md](anytxt-capabilities.md)。
+索引规模等环境数据、官方版本差异与证据来源见 [anytxt-capabilities.md](anytxt-capabilities.md)。

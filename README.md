@@ -6,7 +6,7 @@ AnySirchmunk 计划把 [AnyTXT Searcher](https://anytxt.net/) 的本地全文索
 
 - AnyTXT 负责在已经建立索引的本地文献中快速查找文件和命中片段。
 - Sirchmunk 负责查询规划、证据读取、答案生成、知识聚类、历史知识复用和持久化。
-- 当 AnyTXT 不可用时，可以回退到 Sirchmunk 原有的 `rga` 检索器。
+- 当 AnyTXT 不可用且有明确搜索目录时，可以按配置回退到 Sirchmunk 原有的 `rga` 检索器。
 
 项目目前处于方案设计阶段，尚未提供可运行版本。详细需求见 [docs/requirements.md](docs/requirements.md)，技术方案见 [docs/architecture.md](docs/architecture.md)。
 
@@ -31,7 +31,9 @@ flowchart LR
 2. 将文件路径和命中片段转换为 Sirchmunk 当前检索器使用的数据结构。
 3. 让 Sirchmunk 的 FAST 和 DEEP 查询通过配置选择 AnyTXT。
 4. 继续使用 Sirchmunk 的原始文件读取、证据追踪和知识保存能力。
-5. AnyTXT 不可连接或请求失败时，记录原因并按配置回退到 `rga`。
+5. AnyTXT 不可连接或请求失败时，在显式查询目录或配置的回退根目录内按配置回退到 `rga`；无目录时明确报告不可用。
+
+实施顺序为：锁定 Sirchmunk commit 与检索契约，先完成单关键词 FAST 和原文引用闭环，再加入分页、过滤、有界回退，最后接通 DEEP/ReAct、知识复用并运行性能基准。事件格式一致本身不能证明所有下游路径兼容。
 
 ## 计划中的配置
 
@@ -40,9 +42,14 @@ SIRCHMUNK_SEARCH_BACKEND=anytxt
 ANYTXT_API_URL=http://127.0.0.1:9920
 ANYTXT_SEARCH_LIMIT=300
 ANYTXT_FALLBACK_TO_RGA=true
+ANYTXT_FALLBACK_ROOTS=[]
 ```
 
 默认配置仍将保持 Sirchmunk 原有行为。只有显式选择 `anytxt` 后才使用 AnyTXT 索引。
+
+`ANYTXT_SEARCH_LIMIT` 是页大小。全局搜索失败后，仅在 `ANYTXT_FALLBACK_ROOTS` 配置了绝对目录 JSON 数组时才回退，并明确结果范围已缩小；不会自动扫描当前目录或整盘。文件名搜索也需要明确目录。完整预算配置见需求文档 FR-8。
+
+结果达到预算上限时标记不完整，不对截断集合执行精确 AND/NOT 或计数。正则、字面量转义和大小写行为必须经过验证，未知能力按范围回退或报不支持。
 
 ## 数据位置
 
@@ -68,13 +75,16 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 - [x] 验证 AnyTXT 可以返回命中片段
 - [x] 核对本机 1.3.2477 的索引格式、全局搜索和正则查询行为
 - [x] 梳理 Sirchmunk 检索结果与知识存储链路
+- [ ] 锁定 Sirchmunk commit、依赖与补丁交付步骤
+- [ ] 验证字面量、分页和全局/显式范围调用契约
 - [ ] 实现 AnyTXT JSON-RPC 客户端
 - [ ] 实现 Sirchmunk 检索器适配层
 - [ ] 接入 FAST 和 DEEP 检索
 - [ ] 增加自动回退和诊断日志
 - [ ] 完成本地集成测试
+- [ ] 完成固定语料上的召回与性能基准
 
-本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。其中一个重要结论是：在已安装的 1.3.2477 中，全局 RPC 搜索需要使用空的 `filterDir`；论坛示例中的 `"*"` 在本机返回零结果。实现会进行能力探测，避免依赖单一版本的未文档化行为。
+本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。在已安装的 1.3.2477 中，全局 RPC 搜索使用空 `filterDir`；论坛示例中的 `"*"` 在本机返回零结果。第一版采用此兼容配置；未知版本或语义需已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。
 
 ## 上游项目
 

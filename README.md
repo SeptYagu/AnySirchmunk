@@ -130,12 +130,13 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 `ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，实测命中覆盖 C/D/E 三个卷；查询后的知识簇写入
 `.cache/knowledge/knowledge_clusters.parquet`，并能在下一次查询中复用。
 
-DEEP 这类长查询建议使用低负载配置，并让 AnyTXT 进程带自动重启兜底——本机 1.3.2477 的
-Beta RPC 服务在高负载下会段错误退出（实测见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.4 节）：
+本机 1.3.2477 的 Beta RPC 服务**无法稳定支撑一次完整的 DEEP 查询**：即使两类 RPC 方法已经互斥，
+默认配置下的 DEEP 仍在开始后 49 秒让服务退出（实测见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.4 节）。
+该版本下长查询只能靠进程级自动重启兜底，或者升级 AnyTXT；升级后请用
+`scripts/anytxt_stability_probe.py` 复测同一组参数，再决定是否可以取消兜底：
 
-```dotenv
-ANYTXT_MAX_CONCURRENCY=1
-ANYTXT_MAX_FRAGMENT_REQUESTS=20
+```powershell
+python scripts/anytxt_stability_probe.py --requests 600 --concurrency 2 --fragments-per-search 3
 ```
 
 当前对正则、大小写敏感、whole-word、精确 count，以及包含正则元字符的

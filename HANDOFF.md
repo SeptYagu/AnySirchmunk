@@ -1,15 +1,15 @@
-# AnySirchmunk 交接：v1-only 适配审查修复后的剩余工作
+# AnySirchmunk 交接：自动范围探测与发布基准完成
 
-日期：2026-09-15（第四轮代码审查修复）
+日期：2026-09-16
 
 分支：`main`　上游基线：Sirchmunk `3c7ee54f93fa198db2020a3ab850356f2dacff72`
 
 ## 0. 一句话状态
 
-**AnyTXT v1-only 适配已完成并验收**：接口只剩 `anytxt.v1.*`（`127.0.0.1:9924/rpc`，1.3.3541+），
-legacy `9920` 的全部代码路径、配置项、探针选项、文档与交付模板都已移除；契约测试 39 → 62；
-FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超时，服务 PID 未变。
-第四轮又修复了分页完整性、预算回退、候选上限、非法 `fid` 和安装验证五项问题；剩余工作见 §3。
+**当前版本已达到受控单机环境的稳定使用门槛**：AnyTXT 1.3.3541 v1-only 适配、FAST/DEEP、
+知识复用、自动索引盘探测和 30 查询基准均通过。未指定范围时默认只读探测固定盘，无需用户手填盘符；
+49 份公开 PDF 上 AnyTXT 与 rga 的 recall@10 均为 1.0，热 P95 为 rga 的 34.6%，完整率 100%、回退率 0%。
+仍未定位一次长时间空闲后的 AnyTXT 静默退出，因此此结论不等同于多机或无人值守生产 SLA。
 
 历史文档（本文件的前两版）：
 
@@ -39,7 +39,7 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 | P1 | 文档与基线同步（requirements §8 / capabilities §1、§4、§5、§7、§8 / architecture §4.2 / README / baseline.json） | ✅ `6c76da6` |
 | P2 | 用 v1 能力替换妥协：`search` 精确总数判定完整性、`status` 就绪检查、`order=3` 确定性分页 | ✅ `083226d` |
 | P3 | 服务端表达式取代客户端集合运算；`getFragmentAll` 削减片段请求 | ⬜ 未做 |
-| P4 | 30 查询召回与性能基准；运行时能力探测状态机 | ⬜ 未做 |
+| P4 | 30 查询召回与性能基准；固定盘索引自动探测 | ✅ 本轮完成 |
 | — | 验收记录 | ✅ `2720999` |
 
 ### 2.1 第四轮代码审查修复
@@ -51,7 +51,7 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 - 候选预算按规范化路径后的唯一文件计数，只在尝试加入第 N+1 个唯一候选时触发；恰好达到上限不再误报截断。
 - 非字符串/空 `fid` 在记录验证阶段标为 `invalid_record`，页签名也始终可哈希，不再让整个查询抛 `TypeError`。
 - `scripts/verify.ps1 -SirchmunkPath` 现在核对锁定 HEAD，并要求当前补丁可反向预检；旧补丁、部分补丁或漂移安装不能仅靠编译通过。
-- 以上各有回归测试；当前契约测试共 62 个，补丁对锁定基线的 apply check 通过。
+- 以上各有回归测试；当前测试共 73 个，补丁对锁定基线的 apply check 通过。
 
 关键取证（都改变了实现，详见 `docs/anytxt-capabilities.md` §4.1–4.7）：
 
@@ -88,16 +88,15 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 实测一次请求返回 8 条片段（0.749s），逐条 `getFragment` 则要 8 次请求；DEEP 的片段请求是主要负载来源。
 需要处理：`limit` 取值、多条片段如何映射为多个 `match` 事件、与片段字符/请求预算的交互。
 
-### 3.3 P4-①：固定语料 30 查询召回与性能基准（README 唯一未勾选项）
+### 3.3 P4：已完成的自动范围探测与基准
 
-这是**唯一还没关闭的发布门槛**。门槛定义见 `docs/architecture.md` 第 6 节（recall@K 不低于 rga、
-热缓存检索 P95 不高于 rga 的 80%）。需要：固定的查询集与语料、AnyTXT 与 rga 同条件对照、
-记录 recall@K / P50 / P95 / 请求数 / 片段字符数 / 回退率。`order=3` 已让分页可复现，这是做基准的前提。
-
-### 3.4 P4-②：运行时能力探测状态机（FR-5A）
-
-`_validate_semantics` 目前对正则、大小写、whole-word、count 一律保守拒绝。v1 的表达式语法已有官方文档，
-状态机可以据此简化（至少"表达式语法"不必再探测）；仍需判定 `literal` 转义与是否存在独立搜索模式字段。
+- `ANYTXT_AUTO_DISCOVER_ROOTS=true` 默认枚举本机固定盘，以只读 `anytxt.v1.search` 探针判断索引可用性并缓存；
+  本机 C/D 可检索，E 返回 `errno=1` 后被排除。非空 `ANYTXT_GLOBAL_ROOTS` 仍可显式覆盖。
+- 多词 literal 使用 OR 表达式扩大候选，再以 `getText` 验证连续精确子串；截断文本不能证明不命中，
+  因此只保留可证明的子集并标记不完整。`getText` 不作为最终证据。
+- 30 查询冷/热基准均通过发布门槛。完整结果：
+  `benchmarks/results/2026-09-16-jsbach-30-final.json`。
+- 正则、大小写敏感、whole-word 和含 `&|!()"` 的 literal 仍按未知/不支持能力保守处理；这不是当前发布阻塞项。
 
 ### 3.5 N6：AnyTXT 服务的一次静默退出仍未定位
 
@@ -108,13 +107,13 @@ FAST 与 DEEP 在完整 Sirchmunk 环境通过，全程零连接失败、零超�
 
 ### 3.6 明确不做（保留，避免反复讨论）
 
-`getText` 作为证据来源（会改变证据语义）；自动 `syncIndex` / `ocr`；MCP 端点（`9924/mcp`）；
+`getText` 作为最终证据来源（候选验证用途已启用）；自动 `syncIndex` / `ocr`；MCP 端点（`9924/mcp`）；
 在 v1 上放宽跨类型互斥（属未验证配置）；JSON-RPC 批量请求（`getFragmentAll` 已覆盖主要收益）。
 
 ## 4. 验收与复现入口
 
 ```bash
-# 契约测试（应为 62 个）
+# 契约与基准运行器测试（应为 73 个）
 python -m unittest discover -s tests
 # 补丁三重校验
 git worktree add --detach <原生路径> 3c7ee54f93fa198db2020a3ab850356f2dacff72
@@ -130,16 +129,15 @@ python scripts/anytxt_stability_probe.py --requests 600 --concurrency 2 --fragme
 
 ```bash
 export SIRCHMUNK_SEARCH_BACKEND=anytxt ANYTXT_API_URL=http://127.0.0.1:9924/rpc
-export ANYTXT_GLOBAL_ROOTS='["C:\\","D:\\","E:\\"]' ANYTXT_MAX_CONCURRENCY=2
+export ANYTXT_AUTO_DISCOVER_ROOTS=true ANYTXT_MAX_CONCURRENCY=2
 export SIRCHMUNK_WORK_PATH='D:\OneDrive\SirchmunkData' SIRCHMUNK_SEARCH_PATHS=''
 sirchmunk search "partimento" --mode FAST --work-path 'D:\OneDrive\SirchmunkData' -v
 ```
 
 ## 5. 环境状态
 
-- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，已从可精确识别的历史补丁
-  `daefa4c` 无冲突回滚，并部署 AnySirchmunk `35c72ea` 的当前补丁；62 个契约测试、
-  四个集成文件编译和当前补丁反向预检均通过。部署前目标除旧补丁本身外没有其他改动或未跟踪文件。
+- `C:\Users\12915\Projects\sirchmunk`：HEAD == 锁定 commit，已部署本文件所述当前补丁；
+  测试、集成文件编译和当前补丁反向预检均通过。目标仓库保持 detached baseline + 补丁工作树的交付形式。
 - `D:\OneDrive\SirchmunkData`：工作目录；知识 parquet 已随 DEEP 验收更新（26 353 字节，13:15）。
 - AnyTXT 1.3.3541，`ATGUI.exe` 当前 PID 42368，同时监听 `9920` 与 `9924`（只有 9924 被使用）。
 - 临时探测脚本留在 `.workbuddy/tmp/`（gitignored），可作为契约证据重放。

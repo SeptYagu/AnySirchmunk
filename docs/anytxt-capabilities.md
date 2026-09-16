@@ -134,7 +134,8 @@ anytxt.v1.getFragment
 
 v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `limit=3` 时一次拿到 8 条、
 耗时 0.749s）与 `anytxt.v1.getText`（索引全文，1 MiB 上限，带 `truncated`/`originalBytes`）。
-第一阶段不依赖它们，作为后续优化项。就绪检查用 `anytxt.v1.status`，其 `output.return` 表示引擎是否加载完成。
+当前仅使用 `getText` 对多词 literal 候选做精确子串验证，不把索引全文作为最终证据；
+`getFragmentAll` 仍是后续优化项。就绪检查用 `anytxt.v1.status`，其 `output.return` 表示引擎是否加载完成。
 
 ### 4.3 传输契约
 
@@ -243,7 +244,8 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 | legacy `9920` | 单次请求 0.05s 正常返回；长查询仍会让服务重启，故不再支持 |
 
 本轮据此把 `errno`、精确总数、`order=3`、`status` 与片段标记处理接进适配器；
-`getFragmentAll`、`getText`、`ocr`、`syncIndex` 与 MCP 端点仍列为"明确不做"（理由见技术方案）。
+2026-09-16 又接入 `getText` 作为多词 literal 的候选验证层。`getFragmentAll`、`ocr`、`syncIndex`
+与 MCP 端点仍列为“明确不做”；Sirchmunk 始终从原文件读取最终证据。
 
 ### 4.7 v1-only 适配后的验收（2026-09-15）
 
@@ -258,6 +260,20 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 两次运行期间 `ATGUI.exe` 的 PID 全程为 42368，未变化；查询结束后 `anytxt.v1.status` 仍返回
 `return = true`。相比上一轮"19～32 次偶发超时全部靠重试吸收"的记录，本轮没有再出现超时——
 精确计数让分页在收满即停，减少了单位时间内的请求量。该结论只覆盖单机、单次运行。
+
+### 4.8 自动范围探测、literal 校验与 30 查询基准（2026-09-16）
+
+- Windows 固定盘枚举得到 C、D、E；以不可能命中的 `anytxt.v1.search` 模式只读探测时，
+  C/D 返回 `errno=0, count=0`，E 返回 `errno=1`。因此运行时范围为 C/D，结果按检索器实例缓存；
+  没有遍历文件、读取索引数据库或调用索引写接口。
+- AnyTXT 对含空格 pattern 的行为比 rga 字面子串宽，例如 `two-part inventions` 会产生额外候选。
+  当前实现把多词 literal 改为 OR 候选表达式，并用 `getText` 验证实际大小写不敏感的连续子串；
+  单词仍按子串搜索，以保留 `temperament` 命中 `temperamentvollen` 的 rga 语义。
+- 49 份公开学术 PDF、30 个固定查询的最终结果：AnyTXT 与 rga 平均 recall@10 均为 1.0；
+  热 P95 分别为 1366.56 ms 与 3944.27 ms；AnyTXT 180 次运行完整率 100%、回退率 0%。
+  `classic-romantic` 等少量精度/负例差异来自 AnyTXT 索引文本与 rga 提取文本的规范化差异，
+  不能仅以 rga 零命中判定 AnyTXT 为误报。结果文件见
+  `benchmarks/results/2026-09-16-jsbach-30-final.json`。
 
 ## 5. 全局搜索参数差异
 
@@ -279,8 +295,8 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 服务端把空值解析为它自己的当前目录（本次为 `C:`），返回的 300 条结果全部来自 C 盘。
 
 升级到 1.3.3541 后对 v1 端点重做同一对照：`filterDir` 传 `""` 仍回显 `"C:"`（只返回 C 盘），
-传未索引的卷（例如 `"Z:\\"`）返回 `errno = 1` 与 `count = 0`。因此"全局检索"只能由
-`ANYTXT_GLOBAL_ROOTS` 逐卷请求并合并表达，这一设计不因升级而改变。
+传未索引的卷（例如 `"Z:\\"`）返回 `errno = 1` 与 `count = 0`。因此全局检索必须由明确根目录
+逐卷请求并合并表达；根目录可以由配置提供，也可以由固定盘只读探针发现。
 本机索引实际覆盖 C、D、E 三个卷（索引数据目录中存在 `C.atc`、`D.atc`、`E.atc`，
 以及早期残留的 `F.ati`），因此只查询空 `filterDir` 会静默漏掉 D、E 两个卷。
 此前“空 `filterDir` 表示全局”的记录只验证了“有结果”，没有验证结果覆盖哪些卷。
@@ -292,13 +308,13 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 - 空 `filterDir` 不再被当作全局搜索。它只代表“服务端默认目录”，结果必须标记为
   不完整：`complete=false`、`reason=unverified_global_scope`、
   `effective_scope=anytxt_server_default`，并输出告警提示配置；
-- 覆盖多个卷的全局检索由 `ANYTXT_GLOBAL_ROOTS` 显式声明（例如
-  `["C:\\", "D:\\", "E:\\"]`），适配器对每个根分别请求，再按规范化后的绝对路径去重合并；
+- 覆盖多个卷的全局检索优先使用 `ANYTXT_GLOBAL_ROOTS`；未配置时默认枚举固定盘并以只读 RPC
+  区分已索引盘，对有效根分别请求，再按规范化后的绝对路径去重合并；
 - 显式指定范围时传具体目录；
 - 不硬编码论坛中的 `"*"`；
-- RPC 没有可列出已索引卷的方法（`GetIndexList`、`GetDriveList`、`GetVolumeList`、
-  `GetIndexStat`、`GetVersion`、`GetStatus` 均返回 `404`），卷列表只能由配置提供，
-  适配器不应猜测或扫描磁盘；
+- RPC 没有可直接列出已索引卷的方法（`GetIndexList`、`GetDriveList`、`GetVolumeList`、
+  `GetIndexStat`、`GetVersion`、`GetStatus` 均返回 `404`）；适配器只枚举 Windows 固定盘并以
+  `anytxt.v1.search` 的 `errno` 探测索引可用性，不猜测目录内容、不扫描磁盘；
 - 对其他版本保持能力未知，只有已知内容且确认入索引的测试文件与正反例能够验证最终策略；不凭普通零结果切换参数。
 
 ## 6. 正则搜索
@@ -326,11 +342,11 @@ v1 还提供 `anytxt.v1.getFragmentAll`（一次返回多个片段，实测 `lim
 核查结果对方案的约束：
 
 1. "未指定范围"**不能**用空 `filterDir` 或全局索引查询表达：服务端会把它解析为自己的当前目录。
-   全局检索必须由 `ANYTXT_GLOBAL_ROOTS` 逐卷声明，实际请求数取决于关键词数与分页预算。
+   全局检索由显式 `ANYTXT_GLOBAL_ROOTS` 或固定盘只读探针发现的根逐卷表达，实际请求数取决于关键词数与分页预算。
    （本节初版曾写"默认使用全局索引查询，不必按多个目录拆分"，该结论已被第 5 节实测推翻。）
 2. 用户仍可显式限定目录和扩展名；扩展名过滤在 v1 中同时影响 `getResult` 与 `search` 的计数。
 3. AnyTXT 已覆盖主要文献格式，尤其是 PDF、DOCX 和 TXT。
-4. AnyTXT 负责候选文件和片段；Sirchmunk 继续读取原文件，不依赖 `getText` 之类的全文接口。
+4. AnyTXT 负责候选文件和片段；`getText` 仅验证多词 literal 候选，Sirchmunk 继续读取原文件作为最终证据。
 5. 适配器区分就绪检查（`status`）与语义验证：`errno` 与 JSON-RPC `error` 必须分开处理，
    否则"目录不可检索"会伪装成"目录内无命中"。公开契约仍不完备（字面量转义、正则模式、
    非 0 `errno` 的完整取值域），当前记录是设计依据，不构成完整的兼容性测试报告。

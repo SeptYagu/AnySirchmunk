@@ -19,7 +19,7 @@ SPEC.loader.exec_module(mod)
 
 
 class FakeClient:
-    def __init__(self, pages, fragments=None, totals=None, ready=True, errnos=None):
+    def __init__(self, pages, fragments=None, totals=None, ready=True, errnos=None, texts=None):
         self.pages = pages
         self.fragments = fragments or {}
         #: ``(pattern, filter_dir) -> total rows`` or an explicit SearchTotal.
@@ -30,6 +30,7 @@ class FakeClient:
         #: drive answers errno 1 with an empty payload).
         self.errnos = errnos or {}
         self.ready = ready
+        self.texts = texts or {}
         self.search_calls = []
         self.fragment_calls = []
         self.count_calls = []
@@ -38,14 +39,16 @@ class FakeClient:
     async def search(self, pattern, filter_dir, filter_ext, offset, limit, budget):
         budget.charge()
         self.search_calls.append((pattern, filter_dir, filter_ext, offset, limit))
-        rows, count = self.pages.get((pattern, filter_dir, offset), ([], 0))
-        errno = self.errnos.get((pattern, filter_dir), mod.ERRNO_OK)
+        lookup = pattern.replace(" | ", " ")
+        rows, count = self.pages.get((lookup, filter_dir, offset), ([], 0))
+        errno = self.errnos.get((lookup, filter_dir), mod.ERRNO_OK)
         return mod.SearchPage(tuple(rows), count, errno)
 
     async def count(self, pattern, filter_dir, filter_ext, budget):
         budget.charge()
         self.count_calls.append((pattern, filter_dir, filter_ext))
-        value = self.totals.get((pattern, filter_dir), mod.SearchTotal(None, mod.ERRNO_OK))
+        lookup = pattern.replace(" | ", " ")
+        value = self.totals.get((lookup, filter_dir), mod.SearchTotal(None, mod.ERRNO_OK))
         if isinstance(value, int):
             return mod.SearchTotal(value, mod.ERRNO_OK)
         return value
@@ -58,7 +61,15 @@ class FakeClient:
     async def get_fragment(self, fid, pattern, budget):
         budget.charge()
         self.fragment_calls.append((fid, pattern))
-        value = self.fragments.get((fid, pattern), f"fragment:{pattern}")
+        lookup = pattern.replace(" | ", " ")
+        value = self.fragments.get((fid, lookup), f"fragment:{lookup}")
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    async def get_text(self, fid, budget):
+        budget.charge()
+        value = self.texts.get(fid)
         if isinstance(value, Exception):
             raise value
         return value
@@ -82,7 +93,8 @@ def config(**kwargs):
     values = dict(api_url="http://127.0.0.1:9924/rpc",
                   page_size=2, request_timeout=1, total_timeout=10, max_concurrency=2,
                   max_requests=30, max_candidates=30, max_fragment_chars=1000,
-                  fallback_to_rga=True, fallback_roots=(), global_roots=())
+                  fallback_to_rga=True, fallback_roots=(), global_roots=(),
+                  auto_discover_roots=False)
     values.update(kwargs)
     return mod.AnyTXTConfig(**values)
 
@@ -105,6 +117,14 @@ class ConfigTests(unittest.TestCase):
         # AnyTXT 1.3.2477 segfaults on overlapping requests carrying CJK
         # patterns; concurrency 2 is the highest value verified safe.
         self.assertEqual(mod.AnyTXTConfig().max_concurrency, 2)
+
+    def test_global_root_discovery_is_enabled_by_default_and_configurable(self):
+        self.assertTrue(mod.AnyTXTConfig().auto_discover_roots)
+        with patch.dict(os.environ, {"ANYTXT_AUTO_DISCOVER_ROOTS": "false"}, clear=True):
+            self.assertFalse(mod.AnyTXTConfig.from_env().auto_discover_roots)
+        with patch.dict(os.environ, {"ANYTXT_AUTO_DISCOVER_ROOTS": "sometimes"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "ANYTXT_AUTO_DISCOVER_ROOTS"):
+                mod.AnyTXTConfig.from_env()
 
     def test_environment_defaults_target_the_v1_endpoint(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -169,6 +189,7 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[1]["data"]["path"]["text"], r"D:\docs\a.pdf")
         self.assertEqual(events[1]["data"]["lines"]["text"], "fragment:alpha")
         self.assertEqual(client.search_calls[0][1], "")
+        self.assertEqual(client.search_calls[0][0], "alpha")
         # An empty filterDir is resolved by AnyTXT to its own directory, so the
         # result must not be advertised as a complete global index search.
         self.assertEqual(events.metadata["effective_scope"], mod.SERVER_DEFAULT_SCOPE)
@@ -176,6 +197,43 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(mod.UNVERIFIED_GLOBAL_REASON, events.metadata["reason"])
         merged = retriever.merge_results(events)
         self.assertEqual(merged[0]["_retrieval_metadata"]["actual_backend"], "anytxt")
+
+    async def test_literal_phrase_uses_broad_candidates_then_validates_indexed_text(self):
+        phrase = "two-part inventions"
+        root = r"D:\docs"
+        client = FakeClient(
+            {(phrase, root, 0): ([{"fid": "1", "file": r"D:\docs\a.pdf"}], 1)},
+            totals={(phrase, root): 1},
+            texts={"1": mod.IndexedText("prefix TWO-PART INVENTIONS suffix")},
+        )
+        retriever = mod.AnyTXTRetriever(config=config(), client=client)
+        events = await retriever.retrieve(phrase, path=root, literal=True, regex=False)
+        self.assertEqual(events.metadata["candidates"], 1)
+        self.assertEqual(client.count_calls[0][0], "two-part | inventions")
+        self.assertEqual(client.search_calls[0][0], "two-part | inventions")
+        self.assertEqual(client.fragment_calls, [])
+        self.assertIn("TWO-PART INVENTIONS", events[1]["data"]["lines"]["text"])
+
+    async def test_truncated_indexed_text_without_phrase_is_not_reported_as_complete(self):
+        phrase = "historical background"
+        root = r"D:\docs"
+        client = FakeClient(
+            {(phrase, root, 0): ([{"fid": "1", "file": r"D:\docs\a.pdf"}], 1)},
+            totals={(phrase, root): 1},
+            texts={"1": mod.IndexedText("historical material only", truncated=True)},
+        )
+        retriever = mod.AnyTXTRetriever(config=config(), client=client)
+        events = await retriever.retrieve(phrase, path=root, literal=True, regex=False)
+        self.assertEqual(events.metadata["candidates"], 0)
+        self.assertFalse(events.metadata["complete"])
+        self.assertIn("text_validation_truncated", events.metadata["reason"])
+
+    async def test_unescaped_double_quote_fails_closed(self):
+        retriever = mod.AnyTXTRetriever(
+            config=config(fallback_to_rga=False), client=FakeClient({})
+        )
+        with self.assertRaisesRegex(mod.AnyTXTUnsupportedQuery, "expression operators"):
+            await retriever.retrieve('say "hello"', path=r"D:\docs", literal=True, regex=False)
 
     async def test_paginates_past_fully_filtered_first_page(self):
         root = r"D:\wanted"
@@ -326,6 +384,42 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events.metadata["effective_scope"], roots)
         self.assertTrue(events.metadata["complete"])
+
+    async def test_unconfigured_global_scope_discovers_only_indexed_fixed_drives(self):
+        roots = ["C:\\", "D:\\", "E:\\"]
+        pages = {
+            ("alpha", roots[0], 0): ([{"fid": "1", "file": r"C:\docs\a.pdf"}], 1),
+            ("alpha", roots[1], 0): ([{"fid": "2", "file": r"D:\docs\b.pdf"}], 1),
+        }
+        totals = {
+            (mod.INDEX_SCOPE_PROBE_PATTERN, roots[0]): mod.SearchTotal(0, mod.ERRNO_OK),
+            (mod.INDEX_SCOPE_PROBE_PATTERN, roots[1]): mod.SearchTotal(0, mod.ERRNO_OK),
+            (mod.INDEX_SCOPE_PROBE_PATTERN, roots[2]): mod.SearchTotal(None, 1),
+        }
+        client = FakeClient(pages, totals=totals)
+        retriever = mod.AnyTXTRetriever(
+            config=config(page_size=3, auto_discover_roots=True), client=client
+        )
+        with patch.object(mod, "_fixed_drive_roots", return_value=roots):
+            events = await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+        self.assertEqual(events.metadata["effective_scope"], roots[:2])
+        self.assertEqual(events.metadata["scope_source"], "autodiscovered")
+        self.assertEqual(events.metadata["discovered_roots"], roots[:2])
+        self.assertTrue(events.metadata["complete"])
+        self.assertEqual([call[1] for call in client.search_calls], roots[:2])
+
+    async def test_discovered_roots_are_cached_per_retriever(self):
+        root = "D:\\"
+        client = FakeClient(
+            {},
+            totals={(mod.INDEX_SCOPE_PROBE_PATTERN, root): mod.SearchTotal(0, mod.ERRNO_OK)},
+        )
+        retriever = mod.AnyTXTRetriever(config=config(auto_discover_roots=True), client=client)
+        with patch.object(mod, "_fixed_drive_roots", return_value=[root]):
+            await retriever.retrieve("alpha", path=None, literal=True, regex=False)
+            await retriever.retrieve("beta", path=None, literal=True, regex=False)
+        probes = [call for call in client.count_calls if call[0] == mod.INDEX_SCOPE_PROBE_PATTERN]
+        self.assertEqual(len(probes), 1)
 
     async def test_unverified_global_scope_never_claims_exact_set_operations(self):
         pages = {("alpha", "", 0): ([{"fid": "1", "file": r"C:\a.pdf"}], 1)}
@@ -713,6 +807,22 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(captured["request"].data.decode("utf-8"))
         self.assertEqual(payload["method"], mod.FRAGMENT_METHOD)
         self.assertEqual(payload["params"], {"fid": "fid-1", "pattern": "alpha"})
+
+    async def test_get_text_uses_v1_contract_and_preserves_truncation(self):
+        body = json.dumps({
+            "result": {"errno": 0, "data": {"output": {
+                "text": "indexed text", "truncated": True, "originalBytes": 2000000
+            }}}
+        }).encode()
+        captured, fake_urlopen = self._capture(body)
+        client = mod.AnyTXTClient(config())
+        with patch.object(mod, "urlopen", fake_urlopen):
+            indexed = await client.get_text("fid-1", mod._Budget(config(), 5))
+
+        self.assertEqual(indexed, mod.IndexedText("indexed text", truncated=True))
+        payload = json.loads(captured["request"].data.decode("utf-8"))
+        self.assertEqual(payload["method"], mod.TEXT_METHOD)
+        self.assertEqual(payload["params"], {"fid": "fid-1"})
 
     async def test_unresolvable_fragment_reports_none_instead_of_an_error(self):
         # Measured on 1.3.3541: an unresolvable fid answers errno 1 with

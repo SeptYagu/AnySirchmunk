@@ -1,8 +1,8 @@
 diff --git a/config/env.example b/config/env.example
-index c2c3ae0..e284a94 100644
+index c2c3ae0..52e1c87 100644
 --- a/config/env.example
 +++ b/config/env.example
-@@ -82,6 +82,26 @@ GREP_RGA_BACKOFF_SECONDS=60.0
+@@ -82,6 +82,28 @@ GREP_RGA_BACKOFF_SECONDS=60.0
  # Fall back to native rg when rga is unavailable or times out
  GREP_FALLBACK_TO_RG=true
  
@@ -21,8 +21,10 @@ index c2c3ae0..e284a94 100644
 +ANYTXT_MAX_FRAGMENT_CHARS=100000
 +ANYTXT_MAX_FRAGMENT_REQUESTS=100
 +ANYTXT_FALLBACK_TO_RGA=true
-+# JSON arrays of existing absolute roots. GLOBAL_ROOTS defines a no-path
-+# AnyTXT search; FALLBACK_ROOTS bounds rga fallback and FILENAME_ONLY.
++# With GLOBAL_ROOTS empty, discover indexed local fixed drives using read-only RPC probes.
++ANYTXT_AUTO_DISCOVER_ROOTS=true
++# JSON arrays of existing absolute roots. Non-empty GLOBAL_ROOTS overrides
++# auto-discovery; FALLBACK_ROOTS bounds rga fallback and FILENAME_ONLY.
 +ANYTXT_GLOBAL_ROOTS=[]
 +ANYTXT_FALLBACK_ROOTS=[]
 +
@@ -83,10 +85,10 @@ index 8a6f48b..aba547a 100644
          }
  
 diff --git a/src/sirchmunk/cli/cli.py b/src/sirchmunk/cli/cli.py
-index ba407ed..9d5fe6d 100644
+index ba407ed..4a4eb5a 100644
 --- a/src/sirchmunk/cli/cli.py
 +++ b/src/sirchmunk/cli/cli.py
-@@ -196,6 +196,25 @@ GREP_RGA_BACKOFF_SECONDS=60.0
+@@ -196,6 +196,26 @@ GREP_RGA_BACKOFF_SECONDS=60.0
  # Fall back to native rg when rga is unavailable or times out
  GREP_FALLBACK_TO_RG=true
  
@@ -106,6 +108,7 @@ index ba407ed..9d5fe6d 100644
 +ANYTXT_MAX_FRAGMENT_CHARS=100000
 +ANYTXT_MAX_FRAGMENT_REQUESTS=100
 +ANYTXT_FALLBACK_TO_RGA=true
++ANYTXT_AUTO_DISCOVER_ROOTS=true
 +ANYTXT_GLOBAL_ROOTS=[]
 +ANYTXT_FALLBACK_ROOTS=[]
 +
@@ -114,10 +117,10 @@ index ba407ed..9d5fe6d 100644
  SIRCHMUNK_ENABLE_CLUSTER_REUSE=true
 diff --git a/src/sirchmunk/retrieve/anytxt_retriever.py b/src/sirchmunk/retrieve/anytxt_retriever.py
 new file mode 100644
-index 0000000..bf6f759
+index 0000000..2ad121b
 --- /dev/null
 +++ b/src/sirchmunk/retrieve/anytxt_retriever.py
-@@ -0,0 +1,1160 @@
+@@ -0,0 +1,1319 @@
 +"""AnyTXT Searcher JSON-RPC adapter for Sirchmunk.
 +
 +This module intentionally uses only the Python standard library.  AnyTXT is a
@@ -172,6 +175,7 @@ index 0000000..bf6f759
 +SEARCH_METHOD = "anytxt.v1.getResult"
 +COUNT_METHOD = "anytxt.v1.search"
 +FRAGMENT_METHOD = "anytxt.v1.getFragment"
++TEXT_METHOD = "anytxt.v1.getText"
 +STATUS_METHOD = "anytxt.v1.status"
 +
 +#: ``result.errno`` is AnyTXT's business status and is *not* a transport
@@ -196,6 +200,11 @@ index 0000000..bf6f759
 +SERVER_DEFAULT_SCOPE = "anytxt_server_default"
 +UNVERIFIED_GLOBAL_REASON = "unverified_global_scope"
 +ENGINE_NOT_READY_REASON = "engine_not_ready"
++
++#: A deliberately impossible-looking literal used only to distinguish an
++#: indexed scope (``errno=0, count=0``) from an unindexed one (``errno=1``).
++#: The probe asks AnyTXT's index; it never walks the drive or changes the index.
++INDEX_SCOPE_PROBE_PATTERN = "__anysirchmunk_index_scope_probe_7d63f94c__"
 +
 +
 +class AnyTXTError(RuntimeError):
@@ -277,6 +286,10 @@ index 0000000..bf6f759
 +    #: unverified server default directory is used and the result is reported as
 +    #: incomplete instead of pretending to be a global index search.
 +    global_roots: tuple[str, ...] = ()
++    #: When no global roots are configured, enumerate local fixed-drive roots
++    #: and retain only scopes accepted by AnyTXT.  Explicit configuration
++    #: always wins, and removable/network drives are never probed.
++    auto_discover_roots: bool = True
 +    #: Ask ``anytxt.v1.search`` for the exact total before paging.  One extra
 +    #: request per term and scope turns "did we see every match" from a
 +    #: heuristic into an answer.
@@ -336,6 +349,9 @@ index 0000000..bf6f759
 +        exact = os.getenv("ANYTXT_EXACT_COUNT", "true").strip().lower()
 +        if exact not in {"true", "false", "1", "0", "yes", "no"}:
 +            raise ValueError("ANYTXT_EXACT_COUNT must be a boolean")
++        auto_discover = os.getenv("ANYTXT_AUTO_DISCOVER_ROOTS", "true").strip().lower()
++        if auto_discover not in {"true", "false", "1", "0", "yes", "no"}:
++            raise ValueError("ANYTXT_AUTO_DISCOVER_ROOTS must be a boolean")
 +        return cls(
 +            api_url=api_url,
 +            page_size=page_size,
@@ -350,6 +366,7 @@ index 0000000..bf6f759
 +            fallback_to_rga=fallback in {"true", "1", "yes"},
 +            fallback_roots=tuple(roots),
 +            global_roots=tuple(global_roots),
++            auto_discover_roots=auto_discover in {"true", "1", "yes"},
 +            exact_count=exact in {"true", "1", "yes"},
 +        )
 +
@@ -378,6 +395,14 @@ index 0000000..bf6f759
 +
 +    total: Optional[int]
 +    errno: int = ERRNO_OK
++
++
++@dataclass(frozen=True)
++class IndexedText:
++    """Indexed text returned for literal candidate verification."""
++
++    text: str
++    truncated: bool = False
 +
 +
 +class _Budget:
@@ -613,6 +638,19 @@ index 0000000..bf6f759
 +            raise AnyTXTBackendError("AnyTXT fragment text must be a string")
 +        return text
 +
++    async def get_text(self, fid: Any, budget: _Budget) -> Optional[IndexedText]:
++        """Return indexed text for verification, never as final source evidence."""
++        result = await self._rpc(TEXT_METHOD, {"fid": fid}, budget)
++        if _rpc_errno(result) != ERRNO_OK:
++            return None
++        output = _rpc_output(result)
++        if not isinstance(output, dict):
++            raise AnyTXTBackendError("AnyTXT indexed-text response is missing output")
++        text = output.get("text")
++        if not isinstance(text, str):
++            raise AnyTXTBackendError("AnyTXT indexed text must be a string")
++        return IndexedText(text=text, truncated=output.get("truncated") is True)
++
 +    async def status(self, budget: _Budget) -> Optional[bool]:
 +        """Whether the search engine finished loading, or ``None`` if unknown."""
 +        result = await self._rpc(STATUS_METHOD, {}, budget)
@@ -638,8 +676,6 @@ index 0000000..bf6f759
 +class AnyTXTRetriever(BaseRetriever):
 +    """List-compatible Sirchmunk retriever backed by an AnyTXT index."""
 +
-+    _REGEX_META = re.compile(r"[.\\+*?\[\](){}|^$]")
-+
 +    def __init__(
 +        self,
 +        work_path: Optional[PathLike] = None,
@@ -655,6 +691,7 @@ index 0000000..bf6f759
 +        self.client = client or AnyTXTClient(self.config)
 +        self.fallback = fallback
 +        self.last_metadata: Dict[str, Any] = {}
++        self._discovered_global_roots: Optional[tuple[str, ...]] = None
 +
 +    @staticmethod
 +    def merge_results(raw_results: List[Dict[str, Any]], limit: int = 50) -> List[Dict[str, Any]]:
@@ -750,8 +787,11 @@ index 0000000..bf6f759
 +            raise AnyTXTUnsupportedQuery("case/word/invert/count semantics are not verified")
 +        if regex and not literal:
 +            raise AnyTXTUnsupportedQuery("RPC regular-expression mode is not verified")
-+        if literal and any(self._REGEX_META.search(term) for term in terms):
-+            raise AnyTXTUnsupportedQuery("literal escaping for regex metacharacters is not verified")
++        if any(re.search(r'[&|!()"]', term) for term in terms):
++            # These characters are operators in AnyTXT's expression grammar.
++            # The v1 reference does not document a general escape sequence, so
++            # fail closed instead of allowing a literal to become an expression.
++            raise AnyTXTUnsupportedQuery("literal escaping for AnyTXT expression operators is not verified")
 +
 +    async def _retrieve_anytxt(
 +        self, terms: List[str], roots: List[str], logic: str, max_depth: Optional[int],
@@ -763,19 +803,24 @@ index 0000000..bf6f759
 +        # "No explicit range" cannot be expressed as an empty filterDir: the
 +        # service resolves it to its own default directory and returns that
 +        # drive only, which silently drops every other indexed volume.
++        scope_source = "explicit" if roots else "configured"
 +        scope_roots = roots or list(self.config.global_roots)
++        if not scope_roots and self.config.auto_discover_roots:
++            scope_roots = list(await self._discover_global_roots(budget))
++            scope_source = "autodiscovered"
 +        if scope_roots:
 +            scopes: List[str] = scope_roots
 +            effective_scope: Any = scope_roots
 +        else:
++            scope_source = "server_default"
 +            scopes = [""]
 +            effective_scope = SERVER_DEFAULT_SCOPE
 +            complete = False
 +            reasons.append(UNVERIFIED_GLOBAL_REASON)
 +            logger.warning(
-+                "ANYTXT_GLOBAL_ROOTS is not configured. An empty filterDir is resolved by "
-+                "AnyTXT to its own directory, so this result is not a global index search. "
-+                'Set ANYTXT_GLOBAL_ROOTS, for example ["C:\\\\", "D:\\\\", "E:\\\\"].'
++                "No indexed fixed-drive roots were configured or discovered. An empty "
++                "filterDir is resolved by AnyTXT to its own directory, so this result is "
++                "not a global index search. Set ANYTXT_GLOBAL_ROOTS to override discovery."
 +            )
 +        try:
 +            ready = await self.client.status(budget)
@@ -791,14 +836,17 @@ index 0000000..bf6f759
 +            logger.warning("AnyTXT reports that its search engine has not finished loading")
 +        per_term: List[Dict[str, Dict[str, Any]]] = []
 +        candidate_keys: set[str] = set()
++        text_validation_requests = 0
++        text_validation_chars = 0
 +        for term in terms:
++            wire_pattern = _literal_candidate_expression(term)
 +            found: Dict[str, Dict[str, Any]] = {}
 +            filter_ext = _file_type_glob(file_type)
 +            for scope in scopes:
 +                expected: Optional[int] = None
 +                if self.config.exact_count:
 +                    try:
-+                        total = await self.client.count(term, scope, filter_ext, budget)
++                        total = await self.client.count(wire_pattern, scope, filter_ext, budget)
 +                    except AnyTXTBudgetExhausted:
 +                        # Counting is an optimisation; paging still works without it.
 +                        total = None
@@ -821,7 +869,9 @@ index 0000000..bf6f759
 +                    continue
 +                while True:
 +                    try:
-+                        page = await self.client.search(term, scope, filter_ext, offset, self.config.page_size, budget)
++                        page = await self.client.search(
++                            wire_pattern, scope, filter_ext, offset, self.config.page_size, budget
++                        )
 +                    except AnyTXTBudgetExhausted:
 +                        # Exhausting the request budget degrades the result, it must
 +                        # not throw away the candidates already collected.
@@ -890,6 +940,33 @@ index 0000000..bf6f759
 +                    offset += len(page.files)
 +                if halt_scopes:
 +                    break
++            if _needs_text_validation(term) and found:
++                verified: Dict[str, Dict[str, Any]] = {}
++                for key, candidate in found.items():
++                    try:
++                        text_validation_requests += 1
++                        indexed = await self.client.get_text(candidate["fid"], budget)
++                    except AnyTXTBudgetExhausted:
++                        complete = False
++                        reasons.append("text_validation_budget")
++                        break
++                    except AnyTXTBackendError:
++                        complete = False
++                        reasons.append("text_validation_failure")
++                        continue
++                    if indexed is None:
++                        complete = False
++                        reasons.append("text_validation_unavailable")
++                        continue
++                    text_validation_chars += len(indexed.text)
++                    snippet = _literal_snippet(indexed.text, term)
++                    if snippet is not None:
++                        candidate.setdefault("_validated_snippets", {})[term] = snippet
++                        verified[key] = candidate
++                    elif indexed.truncated:
++                        complete = False
++                        reasons.append("text_validation_truncated")
++                found = verified
 +            per_term.append(found)
 +            if "budget_exhausted" in reasons:
 +                break
@@ -937,10 +1014,15 @@ index 0000000..bf6f759
 +                    fragments_exhausted = True
 +                    break
 +                cache_key = (candidate["fid"], term)
++                validated = candidate.get("_validated_snippets", {}).get(term)
++                raw_text = validated if isinstance(validated, str) else None
 +                try:
-+                    if cache_key not in fragment_cache:
-+                        fragment_cache[cache_key] = await self.client.get_fragment(candidate["fid"], term, fragment_budget)
-+                    raw_text = fragment_cache[cache_key]
++                    if raw_text is None and cache_key not in fragment_cache:
++                        fragment_cache[cache_key] = await self.client.get_fragment(
++                            candidate["fid"], _literal_candidate_expression(term), fragment_budget
++                        )
++                    if raw_text is None:
++                        raw_text = fragment_cache[cache_key]
 +                except AnyTXTBudgetExhausted:
 +                    # Keep every candidate that was already discovered.
 +                    complete = False
@@ -985,6 +1067,10 @@ index 0000000..bf6f759
 +            events.append({"type": "end", "data": common, "_search_backend": "anytxt"})
 +        metadata = self._metadata(complete, not complete, ",".join(dict.fromkeys(reasons)) or None, effective_scope)
 +        metadata.update({
++            "scope_source": scope_source,
++            "discovered_roots": list(self._discovered_global_roots or ()),
++            "text_validation_requests": text_validation_requests,
++            "text_validation_chars": text_validation_chars,
 +            "requests": budget.requests + fragment_budget.requests,
 +            "search_requests": budget.requests,
 +            "fragment_requests": fragment_budget.requests,
@@ -994,6 +1080,26 @@ index 0000000..bf6f759
 +        for event in events:
 +            event["_retrieval_metadata"] = metadata
 +        return RetrievalEvents(events, metadata=metadata)
++
++    async def _discover_global_roots(self, budget: _Budget) -> tuple[str, ...]:
++        """Return fixed-drive roots that the running AnyTXT instance accepts.
++
++        AnyTXT v1 has no index-list method.  On Windows, however, its exact-count
++        endpoint returns ``errno=0`` for an indexed root even when a literal has
++        no matches, and ``errno=1`` for an unindexed root.  Cache the result for
++        this retriever so discovery costs at most one lightweight request per
++        local fixed drive during the process lifetime.
++        """
++        if self._discovered_global_roots is not None:
++            return self._discovered_global_roots
++        discovered: List[str] = []
++        for root in _fixed_drive_roots():
++            total = await self.client.count(INDEX_SCOPE_PROBE_PATTERN, root, "*", budget)
++            if total.errno == ERRNO_OK:
++                discovered.append(root)
++        self._discovered_global_roots = tuple(discovered)
++        logger.info("AnyTXT indexed fixed-drive roots discovered: %s", discovered)
++        return self._discovered_global_roots
 +
 +    @staticmethod
 +    def _combine(groups: List[Dict[str, Dict[str, Any]]], logic: str) -> Dict[str, Dict[str, Any]]:
@@ -1005,12 +1111,23 @@ index 0000000..bf6f759
 +                for key, value in group.items():
 +                    stored = result.setdefault(key, dict(value, _terms=[]))
 +                    stored["_terms"].append(value.get("_term", str(index)))
++                    stored.setdefault("_validated_snippets", {}).update(
++                        value.get("_validated_snippets", {})
++                    )
 +            return result
 +        if logic == "and":
 +            keys = set(groups[0])
 +            for group in groups[1:]:
 +                keys.intersection_update(group)
-+            return {key: dict(groups[0][key], _terms=[group[key]["_term"] for group in groups]) for key in keys}
++            result: Dict[str, Dict[str, Any]] = {}
++            for key in keys:
++                value = dict(groups[0][key], _terms=[group[key]["_term"] for group in groups])
++                snippets: Dict[str, str] = {}
++                for group in groups:
++                    snippets.update(group[key].get("_validated_snippets", {}))
++                value["_validated_snippets"] = snippets
++                result[key] = value
++            return result
 +        excluded = set().union(*(set(group) for group in groups[1:])) if len(groups) > 1 else set()
 +        return {key: dict(value, _terms=[value["_term"]]) for key, value in groups[0].items() if key not in excluded}
 +
@@ -1124,6 +1241,51 @@ index 0000000..bf6f759
 +        fid if isinstance(fid, str) else repr(fid),
 +        file_path if isinstance(file_path, str) else repr(file_path),
 +    )
++
++
++def _fixed_drive_roots() -> List[str]:
++    """Enumerate existing Windows fixed-drive roots without scanning them."""
++    if os.name != "nt":
++        return []
++    try:
++        import ctypes
++
++        kernel32 = ctypes.windll.kernel32
++        mask = int(kernel32.GetLogicalDrives())
++        roots = []
++        for index in range(26):
++            if not mask & (1 << index):
++                continue
++            root = f"{chr(ord('A') + index)}:\\"
++            # DRIVE_FIXED = 3.  Skip removable, optical, RAM and network roots.
++            if int(kernel32.GetDriveTypeW(root)) == 3 and os.path.isdir(root):
++                roots.append(_absolute_path(root))
++        return roots
++    except (AttributeError, OSError, TypeError, ValueError):
++        logger.warning("Unable to enumerate Windows fixed drives for AnyTXT scope discovery")
++        return []
++
++
++def _needs_text_validation(term: str) -> bool:
++    return len(term.split()) > 1
++
++
++def _literal_candidate_expression(term: str) -> str:
++    """Build a recall-oriented candidate expression for a literal substring."""
++    if re.search(r'[&|!()"]', term):
++        raise AnyTXTUnsupportedQuery("literal escaping for AnyTXT expression operators is not verified")
++    tokens = term.split()
++    return " | ".join(tokens) if len(tokens) > 1 else term
++
++
++def _literal_snippet(text: str, term: str, radius: int = 300) -> Optional[str]:
++    """Return context around a case-insensitive exact substring, if present."""
++    index = text.casefold().find(term.casefold())
++    if index < 0:
++        return None
++    start = max(0, index - radius)
++    end = min(len(text), index + len(term) + radius)
++    return ("..." if start else "") + text[start:end] + ("..." if end < len(text) else "")
 +
 +
 +def _search_params(

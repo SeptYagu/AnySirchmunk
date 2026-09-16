@@ -1,4 +1,4 @@
-# AnySirchmunk    （开发中，目前不保证可用）
+# AnySirchmunk（受控环境可稳定使用）
 
 AnySirchmunk 计划把 [AnyTXT Searcher](https://anytxt.net/) 的本地全文索引接入 [Sirchmunk](https://github.com/modelscope/sirchmunk) 的检索链路。
 
@@ -29,7 +29,7 @@ flowchart LR
 
 第一阶段会实现一个 AnyTXT 检索适配器，并尽量保持 Sirchmunk 的下游流程不变：
 
-1. 调用 AnyTXT 本机 JSON-RPC 服务检索关键词：未指定范围时按 `ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，用户明确限定范围时只查询这些目录。
+1. 调用 AnyTXT 本机 JSON-RPC 服务检索关键词：未指定范围时自动探测本机固定盘中的 AnyTXT 索引并逐卷合并；`ANYTXT_GLOBAL_ROOTS` 可显式覆盖，用户限定范围时只查询这些目录。
 2. 将文件路径和命中片段转换为 Sirchmunk 当前检索器使用的数据结构。
 3. 让 Sirchmunk 的 FAST 和 DEEP 查询通过配置选择 AnyTXT。
 4. 继续使用 Sirchmunk 的原始文件读取、证据追踪和知识保存能力。
@@ -52,7 +52,8 @@ ANYTXT_MAX_REQUESTS=100
 ANYTXT_MAX_CANDIDATES=3000
 ANYTXT_MAX_FRAGMENT_CHARS=100000
 ANYTXT_MAX_FRAGMENT_REQUESTS=100
-ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
+ANYTXT_AUTO_DISCOVER_ROOTS=true
+ANYTXT_GLOBAL_ROOTS=[]
 ANYTXT_FALLBACK_TO_RGA=true
 ANYTXT_FALLBACK_ROOTS=[]
 ```
@@ -68,7 +69,11 @@ ANYTXT_FALLBACK_ROOTS=[]
 默认为真，会为每个关键词和目录多发一次 `anytxt.v1.search` 以取得精确命中总数，从而把"是否已取全"
 从启发式变成可判定的结论（设为 false 则退回原有的分页启发式）。
 
-`ANYTXT_GLOBAL_ROOTS` 定义“用户没有指定目录”时的检索范围：AnyTXT 的 RPC 没有枚举已索引卷的方法，而且把空 `filterDir` 解析成它自己的当前目录（1.3.2477 与 1.3.3541 实测都只返回 C 盘），所以不配置它时只查询那个默认目录，结果会被标记为不完整（`unverified_global_scope`）并输出告警，而不会冒充全局结果。本机索引覆盖多个卷时，应按上面示例逐卷列出。目录存在但未被索引时，服务返回 `errno = 1`，该目录会被记为 `scope_errno_1` 且结果不完整，其他目录的命中仍然保留。
+默认的 `ANYTXT_AUTO_DISCOVER_ROOTS=true` 会枚举本机固定盘，并用只读的
+`anytxt.v1.search` 探针判断该盘是否有 AnyTXT 索引；结果按检索器实例缓存，不扫描文件、
+不创建或更新索引，也不探测移动盘和网络盘。`ANYTXT_GLOBAL_ROOTS` 非空时作为明确覆盖，适合需要固定范围的部署。
+如果关闭自动探测且未配置根目录，空 `filterDir` 只会命中 AnyTXT 服务端自己的当前目录，结果会标记为
+`unverified_global_scope`。目录存在但未被索引时返回的 `errno = 1` 不会被误当作“该目录零命中”。
 
 全局搜索失败后，仅在 `ANYTXT_FALLBACK_ROOTS` 配置了绝对目录 JSON 数组时才回退，并明确结果范围已缩小；不会自动扫描当前目录或整盘。文件名搜索也需要明确目录。完整预算配置见需求文档 FR-8。
 
@@ -111,11 +116,11 @@ git -C .\sirchmunk checkout 3c7ee54f93fa198db2020a3ab850356f2dacff72
 ```dotenv
 SIRCHMUNK_SEARCH_BACKEND=anytxt
 ANYTXT_API_URL=http://127.0.0.1:9924/rpc
-ANYTXT_GLOBAL_ROOTS=["C:\\", "D:\\", "E:\\"]
+ANYTXT_AUTO_DISCOVER_ROOTS=true
 ```
 
-不设置 `SIRCHMUNK_SEARCH_BACKEND` 时仍使用上游 `rga`。没有配置 `ANYTXT_GLOBAL_ROOTS` 时，
-不指定目录的查询只会命中 AnyTXT 服务端自己的默认目录，且结果会被标记为不完整。
+不设置 `SIRCHMUNK_SEARCH_BACKEND` 时仍使用上游 `rga`。通常无需填写 `ANYTXT_GLOBAL_ROOTS`；
+若需要严格固定检索盘符，可将其设为绝对目录 JSON 数组，此时显式配置优先于自动探测。
 全局检索发生故障时，只有配置了真实存在的绝对目录数组才允许缩小范围回退：
 
 ```dotenv
@@ -144,14 +149,19 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 - [x] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
 - [x] 适配 AnyTXT 1.3.3541 的 v1 API，并移除 9920 的 legacy 接口
 - [x] 用 v1 的精确命中总数判定结果完整性，并区分"目录不可检索"与"目录内无命中"
-- [ ] 完成固定语料上的召回与性能基准
+- [x] 完成固定语料上的 30 查询召回与性能基准
 
 2026-09-15 在本机完整环境（Sirchmunk `3c7ee54` + `D:\OneDrive\SirchmunkData`）完成了端到端验收：
 FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`（`search_backend=anytxt`，
-事件带 `_search_backend=anytxt`）；无显式范围时按 `ANYTXT_GLOBAL_ROOTS` 逐卷查询并合并，实测命中
-覆盖 C/D/E 三个卷；查询后的知识簇写入 `.cache/knowledge/knowledge_clusters.parquet`，并能在下一次
+事件带 `_search_backend=anytxt`）；查询后的知识簇写入 `.cache/knowledge/knowledge_clusters.parquet`，并能在下一次
 查询中复用。该轮验收在 1.3.2477 上完成；升级到 1.3.3541 后再用 v1 接口复跑了 FAST 与 DEEP，
 服务进程 PID 全程不变（见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.5 节）。
+
+2026-09-16 在 49 份公开学术 PDF、30 个固定查询上完成 1 次冷运行和每查询 5 次热运行：
+AnyTXT 与 rga 的平均 recall@10 均为 1.0；AnyTXT 热 P95 为 1366.56 ms，rga 为 3944.27 ms，
+比例 34.6%，满足“不高于 80%”门槛；180 次 AnyTXT 运行完整率 100%、回退率 0%。
+自动范围探测同时确认本机 C、D 盘可检索，未索引盘被排除。查询集、运行器和完整结果见
+[`benchmarks/`](benchmarks/)；precision 差异包含两套索引/解析器的文本规范化差异，不等同于人工相关性判断。
 
 **版本要求**：1.3.2477 的 Beta RPC 服务在长查询下会退出，因此接口基线定为
 **1.3.3541 及以上**的 v1 API（`http://127.0.0.1:9924/rpc`）。旧版 9920 接口及其 `params.input`
@@ -161,13 +171,18 @@ FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`
 python scripts/anytxt_stability_probe.py --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300
 ```
 
-当前对正则、大小写敏感、whole-word、精确 count，以及包含正则元字符的
+当前对正则、大小写敏感、whole-word、精确 count，以及包含 AnyTXT 表达式运算符的
 literal 查询保持保守策略：显式范围内按配置回退到 `rga`；全局且没有
 `ANYTXT_FALLBACK_ROOTS` 时明确报不支持，不静默改变语义。
 
+普通单词按字面子串查询；含空格的字面短语先用 OR 表达式扩大候选，再以
+`anytxt.v1.getText` 的索引文本做大小写不敏感的精确子串验证。`getText` 只用于候选验证和片段展示，
+最终证据仍由 Sirchmunk 读取原文件；截断文本不能证明“不命中”，因此会把结果标记为不完整。
+
 本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。1.3.2477 与
 1.3.3541 都实测到：全局 RPC 搜索若传空 `filterDir`，服务端会把它解析成自己的当前目录（`C:`）；
-论坛示例中的 `"*"` 在本机返回零结果。因此"全局检索"只能由 `ANYTXT_GLOBAL_ROOTS` 显式声明。
+论坛示例中的 `"*"` 在本机返回零结果。因此全局检索由显式根目录或固定盘只读探针逐卷表达，
+不能把空参数当作全局。
 未知版本或语义需用已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。
 
 ## 上游项目

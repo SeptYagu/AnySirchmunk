@@ -7,9 +7,10 @@
   "verification_python": "3.14.3",
   "requirements_core_sha256": "d0632551a405d91b2da4fe31c9c73151c2793b0ba482aa596a72550efca9a205",
   "requirements_tests_sha256": "82a7e850d2d7714e6d358221dd60ccfbf602f54c3381c1d2d713ae5a9222fab0",
-  "verified_anytxt_version": "1.3.3541.0",
+  "verified_anytxt_edition": "Windows X86_64 OCR",
+  "verified_anytxt_version": "1.3.3514.0",
   "previous_anytxt_version": "1.3.2477.0",
   "anytxt_api": "anytxt.v1 (http://127.0.0.1:9924/rpc)",
-  "anytxt_api_min_version": "1.3.3541",
+  "anytxt_api_baseline": "1.3.3514 (Windows X86_64 OCR)",
   "patch": "patches/sirchmunk-3c7ee54-anytxt.patch"
 }

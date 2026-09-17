@@ -13,7 +13,7 @@ Only the documented v1 interface is probed:
 
 The legacy ``ATRpcServer.Searcher.V1.*`` service on port 9920 is no longer
 supported by this project; the measurements taken against it on 1.3.2477 and
-1.3.3541 are kept in docs/anytxt-capabilities.md as history.
+Windows X86_64 OCR 1.3.3514 are kept in docs/anytxt-capabilities.md as history.
 
 Standard library only.  On Windows it also samples the ATGUI.exe working set so
 a memory leak shows up as a trend rather than a surprise.
@@ -162,7 +162,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     drives = [d.strip() for d in args.drives.split(",") if d.strip()]
 
     if not service_alive(args.host, port):
-        print(f"service is not listening on {args.host}:{port} (AnyTXT v1 API, 1.3.3541+)")
+        print(
+            f"service is not listening on {args.host}:{port} "
+            "(AnyTXT v1 API; verified on Windows X86_64 OCR 1.3.3514)"
+        )
         return 2
 
     fid_pool: List[Tuple[str, str]] = []

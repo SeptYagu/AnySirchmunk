@@ -63,9 +63,13 @@ Restart on Crash 的官方说明确认了这些核心行为：按进程是否运
 | 文件版本 | **1.3.3514.0** |
 | SHA-256 | `2EBE2A37B82AE057B272FC3FF6B300E75AEE476EC473EB856DBFDC930A21E716` |
 
-这里发现一个必须先解决的漂移：当前仓库文档和错误消息要求 **1.3.3541+**，但本机实际可执行文件是
-**1.3.3514.0**。当前 `status` 可用不等于该版本满足全部已声明契约。实施监督器前，应升级到锁定的最低版本，
-或重新验证 1.3.3514 并相应修改版本约束；不能继续同时声称两个版本。
+官网核对确认本机版本正确：AnyTXT 官网 Windows 64 位普通版当前为 1.3.3541，而 **OCR 版当前最高为
+1.3.3514**；官网的 OCR 下载链接直接指向 `Anytxt_1.3.3514_Windows_X86_64_OCR.exe`。本机文件版本、
+窗口标题和官网 OCR 包三者一致，因此 1.3.3514 不是落后版本。仓库原先把普通版版本号 3541 误写成了
+OCR/API 的统一最低版本，现已把已验证基线更正为“Windows X86_64 OCR 1.3.3514”。
+
+官网证据：[Windows 64 位 OCR 1.3.3514 下载页](https://sourceforge.net/projects/anytxt/files/Anytxt_1.3.3514_Windows_X86_64_OCR.exe/download)、
+[Windows 64 位普通版 1.3.3541 下载页](https://sourceforge.net/projects/anytxt/files/Anytxt_1.3.3541_Windows_X86_64.exe/download)。
 
 AnyTXT 官方发布记录显示软件已有“随系统启动”选项，但这只解决登录后的启动，不等于崩溃监督，且本机当前
 启动项中只有 Restart on Crash。参考：[AnyTXT 官方下载与发布记录](https://anytxt.net/download/)。
@@ -231,11 +235,11 @@ ANYTXT_KILL_OWNED_HUNG=false
 
 ## 5. 文件级实施计划
 
-### P0：先清理版本前提
+### P0：锁定 OCR 版本基线（已完成）
 
-1. 将本机 AnyTXT 升级到文档锁定的 1.3.3541+，或对 1.3.3514 重跑完整 v1 契约与稳定性验收后调整要求。
-2. 记录实际 EXE 版本、哈希、`status` 信封和 600 请求稳定性结果。
-3. 不在版本前提未统一时把监督器问题与 API 兼容问题混测。
+1. 官网已确认 Windows X86_64 OCR 当前包为 1.3.3514，普通版才是 1.3.3541。
+2. 本机 OCR `ATGUI.exe` 的文件版本、窗口标题、v1 `status` 与官网包版本一致。
+3. 仓库基线、代码提示、测试和文档已按 OCR 1.3.3514 更正；后续仍按 edition + version 记录，避免再混淆。
 
 ### P1：按需启动，不杀进程
 
@@ -298,7 +302,7 @@ P1 只启动缺失进程，不终止任何进程。它已经可以解决“忘�
 ### 7.1 迁移顺序
 
 1. 备份 Restart on Crash 的 `settings.ini`，但不纳入仓库。
-2. 完成 P0 和 P1；保持 `ANYTXT_PROCESS_MODE=external`，只跑单元测试。
+2. 完成 P1；保持 `ANYTXT_PROCESS_MODE=external`，只跑单元测试。
 3. 在受控窗口中仅把 Restart on Crash 的 AnyTXT `Application1` 设为 disabled，保留 GameViewer 条目。
 4. 设 `ANYTXT_PROCESS_MODE=on_demand`，完成第 6.2 节验收。
 5. 观察至少 7 天；确认没有重启风暴、索引损坏或用户主动退出被误判。
@@ -325,6 +329,7 @@ P1 只启动缺失进程，不终止任何进程。它已经可以解决“忘�
 - 对一次顶层检索最多恢复一次；恢复成功后整轮重放。
 - 外部进程默认永不杀；熔断是发布硬门槛。
 
-实施前唯一 P0：**统一“仓库要求 1.3.3541+”与“本机实际 1.3.3514.0”的版本事实。**
+版本前提已统一：**本项目的已验证基线是官网 Windows X86_64 OCR 1.3.3514。** 普通版 1.3.3541
+是另一安装包的版本号，不再作为 OCR 版升级要求。
 
 本 handoff 是实施方案，不表示监督器已经编码或部署；当前生产行为仍由 Restart on Crash 提供。

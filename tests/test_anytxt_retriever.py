@@ -586,7 +586,7 @@ class RetrieverTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_unsearchable_scope_is_reported_and_other_roots_survive(self):
-        # Measured on 1.3.3541: filterDir pointing at an unindexed volume answers
+        # Measured on Windows X86_64 OCR 1.3.3514: filterDir pointing at an unindexed volume answers
         # errno 1 with an empty payload.  Treating that as "no match" would
         # silently drop a whole drive while still claiming completeness.
         good, bad = r"D:\lib", r"Z:\nowhere"
@@ -825,7 +825,7 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["params"], {"fid": "fid-1"})
 
     async def test_unresolvable_fragment_reports_none_instead_of_an_error(self):
-        # Measured on 1.3.3541: an unresolvable fid answers errno 1 with
+        # Measured on Windows X86_64 OCR 1.3.3514: an unresolvable fid answers errno 1 with
         # text: null, so "no snippet" must not look like a transport failure.
         for body in (
             b'{"result": {"errno": 1, "data": {"output": {"text": null}}}}',
@@ -859,7 +859,7 @@ class RpcContractTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(mod.AnyTXTBackendError) as caught:
                 await client.search("alpha", "", "", 0, 5, mod._Budget(config(), 5))
         message = str(caught.exception)
-        self.assertIn("1.3.3541", message)
+        self.assertIn("1.3.3514", message)
         self.assertIn("9924/rpc", message)
 
     def _capture(self, body: bytes):

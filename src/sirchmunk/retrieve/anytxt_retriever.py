@@ -5,7 +5,7 @@ candidate/fragment service; Sirchmunk remains responsible for reading source
 files and building evidence.
 
 Only the documented AnyTXT **v1** API (``anytxt.v1.*`` on
-``http://127.0.0.1:9924/rpc``, AnyTXT 1.3.3541 or newer) is supported.  The
+``http://127.0.0.1:9924/rpc``, verified on Windows X86_64 OCR 1.3.3514) is supported.  The
 legacy ``ATRpcServer.Searcher.V1.*`` service on port 9920 is not: it cannot
 serve a full DEEP query (it exits mid-run under that load) and it uses a
 different parameter envelope, so supporting both only widened the failure
@@ -56,7 +56,7 @@ TEXT_METHOD = "anytxt.v1.getText"
 STATUS_METHOD = "anytxt.v1.status"
 
 #: ``result.errno`` is AnyTXT's business status and is *not* a transport
-#: failure.  Measured on 1.3.3541: ``filterDir`` pointing at an unindexed
+#: failure.  Measured on Windows X86_64 OCR 1.3.3514: ``filterDir`` pointing at an unindexed
 #: volume and an unresolvable ``fid`` both answer ``errno = 1`` with an empty
 #: payload, while malformed requests use the JSON-RPC ``error`` member
 #: (``-32602``).  Ignoring ``errno`` makes an unsearchable scope look exactly
@@ -145,7 +145,7 @@ class AnyTXTConfig:
     #: several requests overlap with non-ASCII patterns, which kills the whole
     #: service for the rest of the run.  Concurrency 2 passed 90 consecutive
     #: requests including CJK patterns; higher values stay unverified.
-    #: 1.3.3541 survived 600 mixed requests at this value.
+    #: Windows X86_64 OCR 1.3.3514 survived 600 mixed requests at this value.
     max_concurrency: int = 2
     #: Deterministic page ordering.  AnyTXT's default order (0) is not
     #: guaranteed stable across pages, which is what makes a long enumeration
@@ -208,7 +208,7 @@ class AnyTXTConfig:
         if api_mode != "v1":
             raise ValueError(
                 "ANYTXT_API_MODE=%r is no longer supported: AnySirchmunk now requires the AnyTXT "
-                "1.3.3541+ v1 API (anytxt.v1.* on http://127.0.0.1:9924/rpc)" % api_mode
+                "verified v1 API build (Windows X86_64 OCR 1.3.3514; anytxt.v1.* on http://127.0.0.1:9924/rpc)" % api_mode
             )
         api_url = os.getenv("ANYTXT_API_URL", cls.api_url)
         parsed = urlparse(api_url)
@@ -1213,7 +1213,7 @@ def _is_connection_refused(exc: Any) -> bool:
 def _unreachable_message(api_url: str) -> str:
     return (
         f"AnyTXT is not accepting connections at {api_url}. AnySirchmunk requires "
-        "AnyTXT Searcher 1.3.3541 or newer, running, with the local API enabled "
+        "AnyTXT Searcher with the v1 API enabled and running (verified on Windows X86_64 OCR 1.3.3514) "
         "(the legacy 9920 interface is no longer supported)."
     )
 
@@ -1232,7 +1232,7 @@ def _protocol_error_message(error: Any) -> str:
     message = error.get("message") if isinstance(error, dict) else None
     detail = f"{code}: {message}" if code is not None else repr(error)
     if code == -32601:
-        return f"AnyTXT RPC error {detail} — this build does not expose the anytxt.v1 method (1.3.3541+ required)"
+        return f"AnyTXT RPC error {detail} — this build does not expose the anytxt.v1 method (verified baseline: Windows X86_64 OCR 1.3.3514)"
     if code == -32602:
         return f"AnyTXT RPC error {detail} — the adapter sent a parameter this AnyTXT build rejects"
     return f"AnyTXT RPC error {detail}"

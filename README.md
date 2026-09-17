@@ -60,7 +60,7 @@ ANYTXT_FALLBACK_ROOTS=[]
 
 默认配置仍将保持 Sirchmunk 原有行为。只有显式选择 `anytxt` 后才使用 AnyTXT 索引。
 
-接口只有一个：AnyTXT **1.3.3541 及以上**的 v1 API（`anytxt.v1.*`，默认
+接口只有一个：已在 AnyTXT **Windows X86_64 OCR 1.3.3514** 上验证的 v1 API（`anytxt.v1.*`，默认
 `http://127.0.0.1:9924/rpc`）。旧版 9920 的 legacy 接口已移除；`.env` 里若还留着
 `ANYTXT_API_MODE=legacy`，程序会在启动时直接报错，而不是换一套参数静默继续。
 
@@ -92,7 +92,7 @@ AnyTXT 的索引继续由 AnyTXT 自己管理。Sirchmunk 的知识库继续位�
 ## 前置条件
 
 - Windows
-- AnyTXT Searcher 1.3.3541 或更高版本已安装、正在运行并完成文献索引
+- AnyTXT Searcher Windows X86_64 OCR 1.3.3514（或经验证兼容的 v1 构建）已安装、正在运行并完成文献索引
 - AnyTXT v1 本地 API 可通过 `http://127.0.0.1:9924/rpc` 访问（旧版 9920 接口不受支持）
 - Sirchmunk 的 Python 环境可以正常运行
 - 已配置 Sirchmunk 使用的 LLM API
@@ -147,14 +147,14 @@ ANYTXT_FALLBACK_ROOTS=["D:\\Documents"]
 - [x] 增加有界回退、完整性 metadata 和诊断日志
 - [x] 完成模拟 RPC 契约测试、真实 RPC smoke test 及补丁应用/回滚验证
 - [x] 在完整 Sirchmunk 运行环境中完成 FAST/DEEP/知识复用端到端验收
-- [x] 适配 AnyTXT 1.3.3541 的 v1 API，并移除 9920 的 legacy 接口
+- [x] 适配 AnyTXT Windows X86_64 OCR 1.3.3514 的 v1 API，并移除 9920 的 legacy 接口
 - [x] 用 v1 的精确命中总数判定结果完整性，并区分"目录不可检索"与"目录内无命中"
 - [x] 完成固定语料上的 30 查询召回与性能基准
 
 2026-09-15 在本机完整环境（Sirchmunk `3c7ee54` + `D:\OneDrive\SirchmunkData`）完成了端到端验收：
 FAST 与 DEEP 的初始检索、ReAct 后续检索都确认经 `AnyTXTRetriever`（`search_backend=anytxt`，
 事件带 `_search_backend=anytxt`）；查询后的知识簇写入 `.cache/knowledge/knowledge_clusters.parquet`，并能在下一次
-查询中复用。该轮验收在 1.3.2477 上完成；升级到 1.3.3541 后再用 v1 接口复跑了 FAST 与 DEEP，
+查询中复用。该轮验收在 1.3.2477 上完成；升级到 Windows X86_64 OCR 1.3.3514 后再用 v1 接口复跑了 FAST 与 DEEP，
 服务进程 PID 全程不变（见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md) 第 4.5 节）。
 
 2026-09-16 在 49 份公开学术 PDF、30 个固定查询上完成 1 次冷运行和每查询 5 次热运行：
@@ -164,7 +164,7 @@ AnyTXT 与 rga 的平均 recall@10 均为 1.0；AnyTXT 热 P95 为 1366.56 ms，
 [`benchmarks/`](benchmarks/)；precision 差异包含两套索引/解析器的文本规范化差异，不等同于人工相关性判断。
 
 **版本要求**：1.3.2477 的 Beta RPC 服务在长查询下会退出，因此接口基线定为
-**1.3.3541 及以上**的 v1 API（`http://127.0.0.1:9924/rpc`）。旧版 9920 接口及其 `params.input`
+**Windows X86_64 OCR 1.3.3514** 上验证的 v1 API（`http://127.0.0.1:9924/rpc`）。旧版 9920 接口及其 `params.input`
 信封已从代码、配置和文档中移除。需要复测稳定性时用同一个探针脚本：
 
 ```powershell
@@ -180,7 +180,7 @@ literal 查询保持保守策略：显式范围内按配置回退到 `rga`；全
 最终证据仍由 Sirchmunk 读取原文件；截断文本不能证明“不命中”，因此会把结果标记为不完整。
 
 本机能力核查结果和官方资料对照见 [docs/anytxt-capabilities.md](docs/anytxt-capabilities.md)。1.3.2477 与
-1.3.3541 都实测到：全局 RPC 搜索若传空 `filterDir`，服务端会把它解析成自己的当前目录（`C:`）；
+Windows X86_64 OCR 1.3.3514 都实测到：全局 RPC 搜索若传空 `filterDir`，服务端会把它解析成自己的当前目录（`C:`）；
 论坛示例中的 `"*"` 在本机返回零结果。因此全局检索由显式根目录或固定盘只读探针逐卷表达，
 不能把空参数当作全局。
 未知版本或语义需用已入索引的已知测试文件及正反例验证，不能仅凭零结果自动切换参数。

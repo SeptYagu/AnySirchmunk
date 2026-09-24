@@ -168,7 +168,7 @@ AnyTXT 与 rga 的平均 recall@10 均为 1.0；AnyTXT 热 P95 为 1366.56 ms，
 信封已从代码、配置和文档中移除。需要复测稳定性时用同一个探针脚本：
 
 ```powershell
-python scripts/anytxt_stability_probe.py --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300
+.\scripts\dev-python.ps1 scripts\anytxt_stability_probe.py --requests 600 --concurrency 2 --fragments-per-search 3 --limit 300
 ```
 
 当前对正则、大小写敏感、whole-word、精确 count，以及包含 AnyTXT 表达式运算符的

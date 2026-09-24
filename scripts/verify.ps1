@@ -4,11 +4,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$envRoot = $env:AI_ENVS_ROOT
+if ([string]::IsNullOrWhiteSpace($envRoot)) {
+    $envRoot = if (Test-Path "D:\") { "D:\AIenvs" } else { Join-Path $env:LOCALAPPDATA "AIenvs" }
+}
+$python = Join-Path (Join-Path $envRoot "AnySirchmunk") "Scripts\python.exe"
+if (-not (Test-Path $python)) { throw "Run .\scripts\setup_dev.ps1 first." }
 Push-Location $repoRoot
 try {
-    python -m unittest discover -s tests -v
+    & $python -m unittest discover -s tests -v
     if ($LASTEXITCODE -ne 0) { throw "Contract tests failed" }
-    python -m py_compile "src\sirchmunk\retrieve\anytxt_retriever.py"
+    & $python -m py_compile "src\sirchmunk\retrieve\anytxt_retriever.py"
     if ($LASTEXITCODE -ne 0) { throw "Adapter compilation failed" }
 } finally {
     Pop-Location
@@ -30,7 +36,7 @@ if ($SirchmunkPath) {
     if ($LASTEXITCODE -ne 0) {
         throw "Target does not contain the current AnySirchmunk patch or patched files have drifted."
     }
-    python -m py_compile `
+    & $python -m py_compile `
         (Join-Path $target "src\sirchmunk\retrieve\anytxt_retriever.py") `
         (Join-Path $target "src\sirchmunk\agentic\tools.py") `
         (Join-Path $target "src\sirchmunk\cli\cli.py") `
